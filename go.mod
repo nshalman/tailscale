@@ -36,3 +36,5 @@ require (
 	inet.af/netaddr v0.0.0-20200810144936-56928fe48a98
 	rsc.io/goversion v1.2.0
 )
+
+replace github.com/tailscale/wireguard-go => /home/admin/wireguard-go
