@@ -1174,6 +1174,8 @@ func diagnoseTUNFailure(logf logger.Logf) {
 	switch runtime.GOOS {
 	case "linux":
 		diagnoseLinuxTUNFailure(logf)
+	case "illumos":
+		diagnoseLinuxTUNFailure(logf)
 	default:
 		logf("no TUN failure diagnostics for OS %q", runtime.GOOS)
 	}

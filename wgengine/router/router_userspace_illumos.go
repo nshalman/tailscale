@@ -1,16 +1,14 @@
 // Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by a Illumos-style
 // license that can be found in the LICENSE file.
 
-// +build darwin freebsd illumos
+// +build illumos
 
 package router
 
 import (
 	"errors"
 	"fmt"
-	"log"
-	"os/exec"
 
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
@@ -20,7 +18,7 @@ import (
 	"tailscale.com/wgengine/router/dns"
 )
 
-type userspaceBSDRouter struct {
+type userspaceIllumosRouter struct {
 	logf    logger.Logf
 	tunname string
 	local   netaddr.IPPrefix
@@ -29,7 +27,7 @@ type userspaceBSDRouter struct {
 	dns *dns.Manager
 }
 
-func newUserspaceBSDRouter(logf logger.Logf, _ *device.Device, tundev tun.Device) (Router, error) {
+func newUserspaceIllumosRouter(logf logger.Logf, _ *device.Device, tundev tun.Device) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -40,30 +38,25 @@ func newUserspaceBSDRouter(logf logger.Logf, _ *device.Device, tundev tun.Device
 		InterfaceName: tunname,
 	}
 
-	return &userspaceBSDRouter{
+	return &userspaceIllumosRouter{
 		logf:    logf,
 		tunname: tunname,
 		dns:     dns.NewManager(mconfig),
 	}, nil
 }
 
-func cmd(args ...string) *exec.Cmd {
-	if len(args) == 0 {
-		log.Fatalf("exec.Cmd(%#v) invalid; need argv[0]\n", args)
-	}
-	return exec.Command(args[0], args[1:]...)
-}
-
-func (r *userspaceBSDRouter) Up() error {
+func (r *userspaceIllumosRouter) Up() error {
+/*
 	ifup := []string{"ifconfig", r.tunname, "up"}
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
 		r.logf("running ifconfig failed: %v\n%s", err, out)
 		return err
 	}
+*/
 	return nil
 }
 
-func (r *userspaceBSDRouter) Set(cfg *Config) error {
+func (r *userspaceIllumosRouter) Set(cfg *Config) error {
 	if cfg == nil {
 		cfg = &shutdownConfig
 	}
@@ -121,7 +114,7 @@ func (r *userspaceBSDRouter) Set(cfg *Config) error {
 			}
 			routedel := []string{"route", "-q", "-n",
 				del, "-inet", nstr,
-				"-iface", r.tunname}
+				localAddr.IP.String(), "-iface"}
 			out, err := cmd(routedel...).CombinedOutput()
 			if err != nil {
 				r.logf("route del failed: %v: %v\n%s", routedel, err, out)
@@ -138,8 +131,8 @@ func (r *userspaceBSDRouter) Set(cfg *Config) error {
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits)
 			routeadd := []string{"route", "-q", "-n",
-				"add", "-inet", nstr,
-				"-iface", r.tunname}
+				"add", nstr,
+				localAddr.IP.String(), "-iface"}
 			out, err := cmd(routeadd...).CombinedOutput()
 			if err != nil {
 				r.logf("addr add failed: %v: %v\n%s", routeadd, err, out)
@@ -149,6 +142,14 @@ func (r *userspaceBSDRouter) Set(cfg *Config) error {
 			}
 		}
 	}
+
+	// Bring up the interface
+	ifup := []string{"ifconfig", r.tunname, "up"}
+	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
+		r.logf("running ifconfig failed: %v\n%s", err, out)
+		return err
+	}
+	return nil
 
 	// Store the interface and routes so we know what to change on an update.
 	r.local = localAddr
@@ -161,7 +162,7 @@ func (r *userspaceBSDRouter) Set(cfg *Config) error {
 	return errq
 }
 
-func (r *userspaceBSDRouter) Close() error {
+func (r *userspaceIllumosRouter) Close() error {
 	if err := r.dns.Down(); err != nil {
 		r.logf("dns down: %v", err)
 	}
