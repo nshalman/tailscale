@@ -21,8 +21,12 @@ func cleanup(logf logger.Logf, interfaceName string) {
 	// In fact, this will leave a system in a tainted state where starting tailscaled
 	// will result in "interface tailscale0 already exists"
 	// until the defunct interface is ifconfig-destroyed.
-	ifup := []string{"ifconfig", interfaceName, "destroy"}
+	ifup := []string{"ifconfig", interfaceName, "down"}
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
-		logf("ifconfig destroy: %v\n%s", err, out)
+		logf("ifconfig down: %v\n%s", err, out)
+	}
+	ifup = []string{"ifconfig", interfaceName, "unplumb"}
+	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
+		logf("ifconfig unplumb: %v\n%s", err, out)
 	}
 }
