@@ -5,8 +5,12 @@
 package ipn
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"tailscale.com/control/controlclient"
@@ -24,7 +28,7 @@ func fieldsOf(t reflect.Type) (fields []string) {
 func TestPrefsEqual(t *testing.T) {
 	tstest.PanicOnLog()
 
-	prefsHandles := []string{"ControlURL", "RouteAll", "AllowSingleHosts", "CorpDNS", "WantRunning", "ShieldsUp", "AdvertiseTags", "Hostname", "OSVersion", "DeviceModel", "NotepadURLs", "DisableDERP", "AdvertiseRoutes", "NoSNAT", "NetfilterMode", "Persist"}
+	prefsHandles := []string{"ControlURL", "RouteAll", "AllowSingleHosts", "CorpDNS", "WantRunning", "ShieldsUp", "AdvertiseTags", "Hostname", "OSVersion", "DeviceModel", "NotepadURLs", "ForceDaemon", "AdvertiseRoutes", "NoSNAT", "NetfilterMode", "Persist"}
 	if have := fieldsOf(reflect.TypeOf(Prefs{})); !reflect.DeepEqual(have, prefsHandles) {
 		t.Errorf("Prefs.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, prefsHandles)
@@ -277,4 +281,93 @@ func TestPrefsPersist(t *testing.T) {
 		Persist:    &c,
 	}
 	checkPrefs(t, p)
+}
+
+func TestPrefsPretty(t *testing.T) {
+	tests := []struct {
+		p    Prefs
+		os   string
+		want string
+	}{
+		{
+			Prefs{},
+			"linux",
+			"Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off Persist=nil}",
+		},
+		{
+			Prefs{},
+			"windows",
+			"Prefs{ra=false mesh=false dns=false want=false Persist=nil}",
+		},
+		{
+			Prefs{ShieldsUp: true},
+			"windows",
+			"Prefs{ra=false mesh=false dns=false want=false shields=true Persist=nil}",
+		},
+		{
+			Prefs{AllowSingleHosts: true},
+			"windows",
+			"Prefs{ra=false dns=false want=false Persist=nil}",
+		},
+		{
+			Prefs{
+				NotepadURLs:      true,
+				AllowSingleHosts: true,
+			},
+			"windows",
+			"Prefs{ra=false dns=false want=false notepad=true Persist=nil}",
+		},
+		{
+			Prefs{
+				AllowSingleHosts: true,
+				WantRunning:      true,
+				ForceDaemon:      true, // server mode
+			},
+			"windows",
+			"Prefs{ra=false dns=false want=true server=true Persist=nil}",
+		},
+		{
+			Prefs{
+				AllowSingleHosts: true,
+				WantRunning:      true,
+				ControlURL:       "http://localhost:1234",
+				AdvertiseTags:    []string{"tag:foo", "tag:bar"},
+			},
+			"darwin",
+			`Prefs{ra=false dns=false want=true tags=tag:foo,tag:bar url="http://localhost:1234" Persist=nil}`,
+		},
+		{
+			Prefs{
+				Persist: &controlclient.Persist{},
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off Persist{lm=, o=, n= u=""}}`,
+		},
+		{
+			Prefs{
+				Persist: &controlclient.Persist{
+					PrivateNodeKey: wgcfg.PrivateKey{1: 1},
+				},
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off Persist{lm=, o=, n=[B1VKl] u=""}}`,
+		},
+	}
+	for i, tt := range tests {
+		got := tt.p.pretty(tt.os)
+		if got != tt.want {
+			t.Errorf("%d. wrong String:\n got: %s\nwant: %s\n", i, got, tt.want)
+		}
+	}
+}
+
+func TestLoadPrefsNotExist(t *testing.T) {
+	bogusFile := fmt.Sprintf("/tmp/not-exist-%d", time.Now().UnixNano())
+
+	p, err := LoadPrefs(bogusFile)
+	if errors.Is(err, os.ErrNotExist) {
+		// expected.
+		return
+	}
+	t.Fatalf("unexpected prefs=%#v, err=%v", p, err)
 }

@@ -156,6 +156,15 @@ type Client struct {
 	// GetSTUNConn6 is like GetSTUNConn4, but for IPv6.
 	GetSTUNConn6 func() STUNConn
 
+	// SkipExternalNetwork controls whether the client should not try
+	// to reach things other than localhost. This is set to true
+	// in tests to avoid probing the local LAN's router, etc.
+	SkipExternalNetwork bool
+
+	// UDPBindAddr, if non-empty, is the address to listen on for UDP.
+	// It defaults to ":0".
+	UDPBindAddr string
+
 	mu       sync.Mutex            // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
 	prev     map[time.Time]*Report // some previous reports
@@ -169,6 +178,15 @@ type Client struct {
 type STUNConn interface {
 	WriteTo([]byte, net.Addr) (int, error)
 	ReadFrom([]byte) (int, net.Addr, error)
+}
+
+func (c *Client) enoughRegions() int {
+	if c.Verbose {
+		// Abuse verbose a bit here so netcheck can show all region latencies
+		// in verbose mode.
+		return 100
+	}
+	return 3
 }
 
 func (c *Client) logf(format string, a ...interface{}) {
@@ -227,7 +245,6 @@ func (c *Client) ReceiveSTUNPacket(pkt []byte, src netaddr.IPPort) {
 
 	tx, addr, port, err := stun.ParseResponse(pkt)
 	if err != nil {
-		c.mu.Unlock()
 		if _, err := stun.ParseBindingRequest(pkt); err == nil {
 			// This was probably our own netcheck hairpin
 			// check probe coming in late. Ignore.
@@ -615,12 +632,13 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netaddr.IPPort
 	ret.UDP = true
 	updateLatency(ret.RegionLatency, node.RegionID, d)
 
-	// Once we've heard from 3 regions, start a timer to give up
-	// on the other ones.  The timer's duration is a function of
-	// whether this is our initial full probe or an incremental
-	// one. For incremental ones, wait for the duration of the
-	// slowest region. For initial ones, double that.
-	if len(ret.RegionLatency) == 3 {
+	// Once we've heard from enough regions (3), start a timer to
+	// give up on the other ones. The timer's duration is a
+	// function of whether this is our initial full probe or an
+	// incremental one. For incremental ones, wait for the
+	// duration of the slowest region. For initial ones, double
+	// that.
+	if len(ret.RegionLatency) == rs.c.enoughRegions() {
 		timeout := maxDurationValue(ret.RegionLatency)
 		if !rs.incremental {
 			timeout *= 2
@@ -763,6 +781,13 @@ func newReport() *Report {
 	}
 }
 
+func (c *Client) udpBindAddr() string {
+	if v := c.UDPBindAddr; v != "" {
+		return v
+	}
+	return ":0"
+}
+
 // GetReport gets a report.
 //
 // It may not be called concurrently with itself.
@@ -822,8 +847,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 	}
 	defer rs.pc4Hair.Close()
 
-	rs.waitPortMap.Add(1)
-	go rs.probePortMapServices()
+	if !c.SkipExternalNetwork {
+		rs.waitPortMap.Add(1)
+		go rs.probePortMapServices()
+	}
 
 	// At least the Apple Airport Extreme doesn't allow hairpin
 	// sends from a private socket until it's seen traffic from
@@ -841,7 +868,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 	if f := c.GetSTUNConn4; f != nil {
 		rs.pc4 = f()
 	} else {
-		u4, err := netns.Listener().ListenPacket(ctx, "udp4", ":0")
+		u4, err := netns.Listener().ListenPacket(ctx, "udp4", c.udpBindAddr())
 		if err != nil {
 			c.logf("udp4: %v", err)
 			return nil, err
@@ -854,7 +881,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 		if f := c.GetSTUNConn6; f != nil {
 			rs.pc6 = f()
 		} else {
-			u6, err := netns.Listener().ListenPacket(ctx, "udp6", ":0")
+			u6, err := netns.Listener().ListenPacket(ctx, "udp6", c.udpBindAddr())
 			if err != nil {
 				c.logf("udp6: %v", err)
 			} else {
@@ -893,8 +920,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 
 	rs.waitHairCheck(ctx)
 	c.vlogf("hairCheck done")
-	rs.waitPortMap.Wait()
-	c.vlogf("portMap done")
+	if !c.SkipExternalNetwork {
+		rs.waitPortMap.Wait()
+		c.vlogf("portMap done")
+	}
 	rs.stopTimers()
 
 	// Try HTTPS latency check if all STUN probes failed due to UDP presumably being blocked.

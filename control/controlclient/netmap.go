@@ -30,6 +30,7 @@ type NetworkMap struct {
 	Addresses     []wgcfg.CIDR
 	LocalPort     uint16 // used for debugging
 	MachineStatus tailcfg.MachineStatus
+	MachineKey    tailcfg.MachineKey
 	Peers         []*tailcfg.Node // sorted by Node.ID
 	DNS           tailcfg.DNSConfig
 	Hostinfo      tailcfg.Hostinfo
@@ -49,7 +50,6 @@ type NetworkMap struct {
 	// TODO(crawshaw): reduce UserProfiles to []tailcfg.UserProfile?
 	// There are lots of ways to slice this data, leave it up to users.
 	UserProfiles map[tailcfg.UserID]tailcfg.UserProfile
-	Roles        []tailcfg.Role
 	// TODO(crawshaw): Groups       []tailcfg.Group
 	// TODO(crawshaw): Capabilities []tailcfg.Capability
 }
@@ -75,6 +75,15 @@ func (nm *NetworkMap) Concise() string {
 func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 	fmt.Fprintf(buf, "netmap: self: %v auth=%v",
 		nm.NodeKey.ShortString(), nm.MachineStatus)
+	login := nm.UserProfiles[nm.User].LoginName
+	if login == "" {
+		if nm.User.IsZero() {
+			login = "?"
+		} else {
+			login = fmt.Sprint(nm.User)
+		}
+	}
+	fmt.Fprintf(buf, " u=%s", login)
 	if nm.LocalPort != 0 {
 		fmt.Fprintf(buf, " port=%v", nm.LocalPort)
 	}
@@ -92,6 +101,7 @@ func (a *NetworkMap) equalConciseHeader(b *NetworkMap) bool {
 	if a.NodeKey != b.NodeKey ||
 		a.MachineStatus != b.MachineStatus ||
 		a.LocalPort != b.LocalPort ||
+		a.User != b.User ||
 		len(a.Addresses) != len(b.Addresses) {
 		return false
 	}
@@ -219,7 +229,6 @@ const (
 	AllowSingleHosts WGConfigFlags = 1 << iota
 	AllowSubnetRoutes
 	AllowDefaultRoute
-	HackDefaultRoute
 )
 
 // EndpointDiscoSuffix is appended to the hex representation of a peer's discovery key
@@ -274,11 +283,7 @@ func (nm *NetworkMap) WGCfg(logf logger.Logf, flags WGConfigFlags) (*wgcfg.Confi
 					logf("wgcfg: %v skipping default route", peer.Key.ShortString())
 					continue
 				}
-				if (flags & HackDefaultRoute) != 0 {
-					allowedIP = wgcfg.CIDR{IP: wgcfg.IPv4(10, 0, 0, 0), Mask: 8}
-					logf("wgcfg: %v converting default route => %v", peer.Key.ShortString(), allowedIP.String())
-				}
-			} else if allowedIP.Mask < 32 {
+			} else if cidrIsSubnet(peer, allowedIP) {
 				if (flags & AllowSubnetRoutes) == 0 {
 					logf("wgcfg: %v skipping subnet route", peer.Key.ShortString())
 					continue
@@ -289,6 +294,29 @@ func (nm *NetworkMap) WGCfg(logf logger.Logf, flags WGConfigFlags) (*wgcfg.Confi
 	}
 
 	return cfg, nil
+}
+
+// cidrIsSubnet reports whether cidr is a non-default-route subnet
+// exported by node that is not one of its own self addresses.
+func cidrIsSubnet(node *tailcfg.Node, cidr wgcfg.CIDR) bool {
+	if cidr.Mask == 0 {
+		return false
+	}
+	if cidr.Mask < 32 {
+		// Fast path for IPv4, to avoid loop below.
+		//
+		// TODO: if cidr.IP is an IPv6 address, we could do "< 128"
+		// to avoid the range over node.Addresses. Or we could
+		// just remove this fast path and unconditionally do the range
+		// loop.
+		return true
+	}
+	for _, selfCIDR := range node.Addresses {
+		if cidr == selfCIDR {
+			return false
+		}
+	}
+	return true
 }
 
 func appendEndpoint(peer *wgcfg.Peer, epStr string) error {

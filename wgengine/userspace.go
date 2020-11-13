@@ -33,10 +33,12 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/monitor"
@@ -46,7 +48,7 @@ import (
 	"tailscale.com/wgengine/tstun"
 )
 
-// minimalMTU is the MTU we set on tailscale's tuntap
+// minimalMTU is the MTU we set on tailscale's TUN
 // interface. wireguard-go defaults to 1420 bytes, which only works if
 // the "outer" MTU is 1500 bytes. This breaks on DSL connections
 // (typically 1492 MTU) and on GCE (1460 MTU?!).
@@ -60,9 +62,6 @@ const (
 	magicDNSIP   = 0x64646464 // 100.100.100.100
 	magicDNSPort = 53
 )
-
-// magicDNSDomain is the parent domain for Tailscale nodes.
-const magicDNSDomain = "b.tailscale.net."
 
 // Lazy wireguard-go configuration parameters.
 const (
@@ -108,16 +107,18 @@ type userspaceEngine struct {
 	lastEngineSigFull   string // of full wireguard config
 	lastEngineSigTrim   string // of trimmed wireguard config
 	recvActivityAt      map[tailcfg.DiscoKey]time.Time
-	sentActivityAt      map[packet.IP]*int64 // value is atomic int64 of unixtime
+	trimmedDisco        map[tailcfg.DiscoKey]bool // set of disco keys of peers currently excluded from wireguard config
+	sentActivityAt      map[packet.IP]*int64      // value is atomic int64 of unixtime
 	destIPActivityFuncs map[packet.IP]func()
 
-	mu             sync.Mutex // guards following; see lock order comment below
-	closing        bool       // Close was called (even if we're still closing)
-	statusCallback StatusCallback
-	peerSequence   []wgcfg.Key
-	endpoints      []string
-	pingers        map[wgcfg.Key]*pinger // legacy pingers for pre-discovery peers
-	linkState      *interfaces.State
+	mu                 sync.Mutex // guards following; see lock order comment below
+	closing            bool       // Close was called (even if we're still closing)
+	statusCallback     StatusCallback
+	linkChangeCallback func(major bool, newState *interfaces.State)
+	peerSequence       []wgcfg.Key
+	endpoints          []string
+	pingers            map[wgcfg.Key]*pinger // legacy pingers for pre-discovery peers
+	linkState          *interfaces.State
 
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
 }
@@ -140,17 +141,8 @@ type EngineConfig struct {
 	Fake bool
 }
 
-type Loggify struct {
-	f logger.Logf
-}
-
-func (l *Loggify) Write(b []byte) (int, error) {
-	l.f(string(b))
-	return len(b), nil
-}
-
 func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16) (Engine, error) {
-	logf("Starting userspace wireguard engine (FAKE tuntap device).")
+	logf("Starting userspace wireguard engine (with fake TUN device)")
 	conf := EngineConfig{
 		Logf:       logf,
 		TUN:        tstun.NewFakeTUN(),
@@ -201,13 +193,17 @@ func NewUserspaceEngineAdvanced(conf EngineConfig) (Engine, error) {
 func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	logf := conf.Logf
 
+	rconf := tsdns.ResolverConfig{
+		Logf:    conf.Logf,
+		Forward: true,
+	}
 	e := &userspaceEngine{
 		timeNow:  time.Now,
 		logf:     logf,
 		reqCh:    make(chan struct{}, 1),
 		waitCh:   make(chan struct{}),
 		tundev:   tstun.WrapTUN(logf, conf.TUN),
-		resolver: tsdns.NewResolver(logf, magicDNSDomain),
+		resolver: tsdns.NewResolver(rconf),
 		pingers:  make(map[wgcfg.Key]*pinger),
 	}
 	e.localAddrs.Store(map[packet.IP]bool{})
@@ -220,7 +216,10 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	}
 	e.tundev.PreFilterOut = e.handleLocalPackets
 
-	mon, err := monitor.New(logf, func() { e.LinkChange(false) })
+	mon, err := monitor.New(logf, func() {
+		e.LinkChange(false)
+		tshttpproxy.InvalidateCache()
+	})
 	if err != nil {
 		e.tundev.Close()
 		return nil, err
@@ -238,6 +237,7 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		Logf:             logf,
 		Port:             conf.ListenPort,
 		EndpointsFunc:    endpointsFn,
+		DERPActiveFunc:   e.RequestStatus,
 		IdleFunc:         e.tundev.IdleDuration,
 		NoteRecvActivity: e.noteReceiveActivity,
 	}
@@ -246,10 +246,11 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		e.tundev.Close()
 		return nil, fmt.Errorf("wgengine: %v", err)
 	}
+	e.magicConn.SetNetworkUp(e.linkState.AnyInterfaceUp())
 
 	// flags==0 because logf is already nested in another logger.
 	// The outer one can display the preferred log prefixes, etc.
-	dlog := log.New(&Loggify{logf}, "", 0)
+	dlog := logger.StdLogger(logf)
 	logger := device.Logger{
 		Debug: dlog,
 		Info:  dlog,
@@ -300,6 +301,7 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	}
 
 	// wgdev takes ownership of tundev, will close it when closed.
+	e.logf("Creating wireguard device...")
 	e.wgdev = device.NewDevice(e.tundev, opts)
 	defer func() {
 		if reterr != nil {
@@ -309,6 +311,7 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 
 	// Pass the underlying tun.(*NativeDevice) to the router:
 	// routers do not Read or Write, but do access native interfaces.
+	e.logf("Creating router...")
 	e.router, err = conf.RouterGen(logf, e.wgdev, e.tundev.Unwrap())
 	if err != nil {
 		e.magicConn.Close()
@@ -335,7 +338,9 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		}
 	}()
 
+	e.logf("Bringing wireguard device up...")
 	e.wgdev.Up()
+	e.logf("Bringing router up...")
 	if err := e.router.Up(); err != nil {
 		e.magicConn.Close()
 		e.wgdev.Close()
@@ -343,17 +348,24 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 	}
 	// TODO(danderson): we should delete this. It's pointless to apply
 	// a no-op settings here.
+	// TODO(bradfitz): counter-point: it tests the router implementation early
+	// to see if any part of it might fail.
+	e.logf("Clearing router settings...")
 	if err := e.router.Set(nil); err != nil {
 		e.magicConn.Close()
 		e.wgdev.Close()
 		return nil, err
 	}
+	e.logf("Starting link monitor...")
 	e.linkMon.Start()
+	e.logf("Starting magicsock...")
 	e.magicConn.Start()
 
+	e.logf("Starting resolver...")
 	e.resolver.Start()
 	go e.pollResolver()
 
+	e.logf("Engine created.")
 	return e, nil
 }
 
@@ -362,10 +374,15 @@ func echoRespondToAll(p *packet.ParsedPacket, t *tstun.TUN) filter.Response {
 	if p.IsEchoRequest() {
 		header := p.ICMPHeader()
 		header.ToResponse()
-		packet := packet.Generate(&header, p.Payload())
-		t.InjectOutbound(packet)
-		// We already handled it, stop.
-		return filter.Drop
+		outp := packet.Generate(&header, p.Payload())
+		t.InjectOutbound(outp)
+		// We already responded to it, but it's not an error.
+		// Proceed with regular delivery. (Since this code is only
+		// used in fake mode, regular delivery just means throwing
+		// it away. If this ever gets run in non-fake mode, you'll
+		// get double responses to pings, which is an indicator you
+		// shouldn't be doing that I guess.)
+		return filter.Accept
 	}
 	return filter.Accept
 }
@@ -569,7 +586,10 @@ func (e *userspaceEngine) pinger(peerKey wgcfg.Key, ips []wgcfg.IP) {
 	p.run(ctx, peerKey, ips, srcIP)
 }
 
-var debugTrimWireguard, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_TRIM_WIREGUARD"))
+var (
+	debugTrimWireguardEnv = os.Getenv("TS_DEBUG_TRIM_WIREGUARD")
+	debugTrimWireguard, _ = strconv.ParseBool(debugTrimWireguardEnv)
+)
 
 // forceFullWireguardConfig reports whether we should give wireguard
 // our full network map, even for inactive peers
@@ -579,9 +599,13 @@ var debugTrimWireguard, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_TRIM_WIREGUARD
 // and we haven't got enough time testing it.
 func forceFullWireguardConfig(numPeers int) bool {
 	// Did the user explicitly enable trimmming via the environment variable knob?
-	if debugTrimWireguard {
-		return false
+	if debugTrimWireguardEnv != "" {
+		return !debugTrimWireguard
 	}
+	if opt := controlclient.TrimWGConfig(); opt != "" {
+		return !opt.EqualBool(true)
+	}
+
 	// On iOS with large networks, it's critical, so turn on trimming.
 	// Otherwise we run out of memory from wireguard-go goroutine stacks+buffers.
 	// This will be the default later for all platforms and network sizes.
@@ -589,7 +613,7 @@ func forceFullWireguardConfig(numPeers int) bool {
 	if iOS && numPeers > 50 {
 		return false
 	}
-	return true
+	return false
 }
 
 // isTrimmablePeer reports whether p is a peer that we can trim out of the
@@ -627,9 +651,11 @@ func (e *userspaceEngine) noteReceiveActivity(dk tailcfg.DiscoKey) {
 	e.wgLock.Lock()
 	defer e.wgLock.Unlock()
 
-	was, ok := e.recvActivityAt[dk]
-	if !ok {
+	if _, ok := e.recvActivityAt[dk]; !ok {
 		// Not a trimmable peer we care about tracking. (See isTrimmablePeer)
+		if e.trimmedDisco[dk] {
+			e.logf("wgengine: [unexpected] noteReceiveActivity called on idle discokey %v that's not in recvActivityAt", dk.ShortString())
+		}
 		return
 	}
 	now := e.timeNow()
@@ -641,7 +667,8 @@ func (e *userspaceEngine) noteReceiveActivity(dk tailcfg.DiscoKey) {
 	// lazyPeerIdleThreshold without the divide by 2, but
 	// maybeReconfigWireguardLocked is cheap enough to call every
 	// couple minutes (just not on every packet).
-	if was.IsZero() || now.Sub(was) > lazyPeerIdleThreshold/2 {
+	if e.trimmedDisco[dk] {
+		e.logf("wgengine: idle peer %v now active, reconfiguring wireguard", dk.ShortString())
 		e.maybeReconfigWireguardLocked()
 	}
 }
@@ -709,6 +736,8 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked() error {
 	trackDisco := make([]tailcfg.DiscoKey, 0, len(full.Peers))
 	trackIPs := make([]wgcfg.IP, 0, len(full.Peers))
 
+	trimmedDisco := map[tailcfg.DiscoKey]bool{} // TODO: don't re-alloc this map each time
+
 	for i := range full.Peers {
 		p := &full.Peers[i]
 		if !isTrimmablePeer(p, len(full.Peers)) {
@@ -721,13 +750,17 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked() error {
 		trackIPs = append(trackIPs, tsIP)
 		if e.isActiveSince(dk, tsIP, activeCutoff) {
 			min.Peers = append(min.Peers, *p)
+		} else {
+			trimmedDisco[dk] = true
 		}
 	}
 
-	if !deepprint.UpdateHash(&e.lastEngineSigTrim, min) {
+	if !deepprint.UpdateHash(&e.lastEngineSigTrim, min, trimmedDisco, trackDisco, trackIPs) {
 		// No changes
 		return nil
 	}
+
+	e.trimmedDisco = trimmedDisco
 
 	e.updateActivityMapsLocked(trackDisco, trackIPs)
 
@@ -849,11 +882,16 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config) 
 	if routerChanged {
 		if routerCfg.DNS.Proxied {
 			ips := routerCfg.DNS.Nameservers
-			nameservers := make([]string, len(ips))
+			upstreams := make([]net.Addr, len(ips))
 			for i, ip := range ips {
-				nameservers[i] = net.JoinHostPort(ip.String(), "53")
+				stdIP := ip.IPAddr()
+				upstreams[i] = &net.UDPAddr{
+					IP:   stdIP.IP,
+					Port: 53,
+					Zone: stdIP.Zone,
+				}
 			}
-			e.resolver.SetNameservers(nameservers)
+			e.resolver.SetUpstreams(upstreams)
 			routerCfg.DNS.Nameservers = []netaddr.IP{tsaddr.TailscaleServiceIP()}
 		}
 		e.logf("wgengine: Reconfig: configuring router")
@@ -1072,6 +1110,7 @@ func (e *userspaceEngine) Close() {
 	e.linkMon.Close()
 	e.router.Close()
 	e.wgdev.Close()
+	e.tundev.Close()
 
 	// Shut down pingers after tundev is closed (by e.wgdev.Close) so the
 	// synchronous close does not get stuck on InjectOutbound.
@@ -1086,15 +1125,15 @@ func (e *userspaceEngine) Wait() {
 	<-e.waitCh
 }
 
-func (e *userspaceEngine) setLinkState(st *interfaces.State) (changed bool) {
+func (e *userspaceEngine) setLinkState(st *interfaces.State) (changed bool, cb func(major bool, newState *interfaces.State)) {
 	if st == nil {
-		return false
+		return false, nil
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	changed = e.linkState == nil || !st.Equal(e.linkState)
 	e.linkState = st
-	return changed
+	return changed, e.linkChangeCallback
 }
 
 func (e *userspaceEngine) LinkChange(isExpensive bool) {
@@ -1104,13 +1143,18 @@ func (e *userspaceEngine) LinkChange(isExpensive bool) {
 		return
 	}
 	cur.IsExpensive = isExpensive
-	needRebind := e.setLinkState(cur)
+	needRebind, linkChangeCallback := e.setLinkState(cur)
 
-	if needRebind {
-		e.logf("LinkChange: major, rebinding. New state: %+v", cur)
+	up := cur.AnyInterfaceUp()
+	if !up {
+		e.logf("LinkChange: all links down; pausing: %v", cur)
+	} else if needRebind {
+		e.logf("LinkChange: major, rebinding. New state: %v", cur)
 	} else {
 		e.logf("LinkChange: minor")
 	}
+
+	e.magicConn.SetNetworkUp(up)
 
 	why := "link-change-minor"
 	if needRebind {
@@ -1118,6 +1162,18 @@ func (e *userspaceEngine) LinkChange(isExpensive bool) {
 		e.magicConn.Rebind()
 	}
 	e.magicConn.ReSTUN(why)
+	if linkChangeCallback != nil {
+		go linkChangeCallback(needRebind, cur)
+	}
+}
+
+func (e *userspaceEngine) SetLinkChangeCallback(cb func(major bool, newState *interfaces.State)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.linkChangeCallback = cb
+	if e.linkState != nil {
+		go cb(false, e.linkState)
+	}
 }
 
 func getLinkState() (*interfaces.State, error) {
@@ -1212,9 +1268,8 @@ func diagnoseLinuxTUNFailure(logf logger.Logf) {
 	}
 	logf("is CONFIG_TUN enabled in your kernel? `modprobe tun` failed with: %s", modprobeOut)
 
-	distro := linuxDistro()
-	switch distro {
-	case "debian":
+	switch distro.Get() {
+	case distro.Debian:
 		dpkgOut, err := exec.Command("dpkg", "-S", "kernel/drivers/net/tun.ko").CombinedOutput()
 		if len(bytes.TrimSpace(dpkgOut)) == 0 || err != nil {
 			logf("tun module not loaded nor found on disk")
@@ -1223,7 +1278,7 @@ func diagnoseLinuxTUNFailure(logf logger.Logf) {
 		if !bytes.Contains(dpkgOut, kernel) {
 			logf("kernel/drivers/net/tun.ko found on disk, but not for current kernel; are you in middle of a system update and haven't rebooted? found: %s", dpkgOut)
 		}
-	case "arch":
+	case distro.Arch:
 		findOut, err := exec.Command("find", "/lib/modules/", "-path", "*/net/tun.ko*").CombinedOutput()
 		if len(bytes.TrimSpace(findOut)) == 0 || err != nil {
 			logf("tun module not loaded nor found on disk")
@@ -1232,15 +1287,16 @@ func diagnoseLinuxTUNFailure(logf logger.Logf) {
 		if !bytes.Contains(findOut, kernel) {
 			logf("kernel/drivers/net/tun.ko found on disk, but not for current kernel; are you in middle of a system update and haven't rebooted? found: %s", findOut)
 		}
+	case distro.OpenWrt:
+		out, err := exec.Command("opkg", "list-installed").CombinedOutput()
+		if err != nil {
+			logf("error querying OpenWrt installed packages: %s", out)
+			return
+		}
+		for _, pkg := range []string{"kmod-tun", "ca-bundle"} {
+			if !bytes.Contains(out, []byte(pkg+" - ")) {
+				logf("Missing required package %s; run: opkg install %s", pkg, pkg)
+			}
+		}
 	}
-}
-
-func linuxDistro() string {
-	if _, err := os.Stat("/etc/debian_version"); err == nil {
-		return "debian"
-	}
-	if _, err := os.Stat("/etc/arch-release"); err == nil {
-		return "arch"
-	}
-	return ""
 }

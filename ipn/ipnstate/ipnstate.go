@@ -27,8 +27,10 @@ import (
 type Status struct {
 	BackendState string
 	TailscaleIPs []netaddr.IP // Tailscale IP(s) assigned to this node
-	Peer         map[key.Public]*PeerStatus
-	User         map[tailcfg.UserID]tailcfg.UserProfile
+	Self         *PeerStatus
+
+	Peer map[key.Public]*PeerStatus
+	User map[tailcfg.UserID]tailcfg.UserProfile
 }
 
 func (s *Status) Peers() []key.Public {
@@ -43,6 +45,7 @@ func (s *Status) Peers() []key.Public {
 type PeerStatus struct {
 	PublicKey key.Public
 	HostName  string // HostInfo's Hostname (not a DNS name or necessarily unique)
+	DNSName   string
 	OS        string // HostInfo.OS
 	UserID    tailcfg.UserID
 
@@ -88,11 +91,24 @@ type StatusBuilder struct {
 	st     Status
 }
 
+func (sb *StatusBuilder) SetBackendState(v string) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.st.BackendState = v
+}
+
 func (sb *StatusBuilder) Status() *Status {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	sb.locked = true
 	return &sb.st
+}
+
+// SetSelfStatus sets the status of the local machine.
+func (sb *StatusBuilder) SetSelfStatus(ss *PeerStatus) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.st.Self = ss
 }
 
 // AddUser adds a user profile to the status.
@@ -150,6 +166,9 @@ func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
 
 	if v := st.HostName; v != "" {
 		e.HostName = v
+	}
+	if v := st.DNSName; v != "" {
+		e.DNSName = v
 	}
 	if v := st.Relay; v != "" {
 		e.Relay = v

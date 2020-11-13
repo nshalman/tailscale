@@ -46,6 +46,10 @@ import (
 	"tailscale.com/wgengine/tstun"
 )
 
+func init() {
+	os.Setenv("IN_TS_TEST", "1")
+}
+
 // WaitReady waits until the magicsock is entirely initialized and connected
 // to its home DERP server. This is normally not necessary, since magicsock
 // is intended to be entirely asynchronous, but it helps eliminate race
@@ -118,7 +122,7 @@ type magicStack struct {
 	privateKey wgcfg.PrivateKey
 	epCh       chan []string       // endpoint updates produced by this peer
 	conn       *Conn               // the magicsock itself
-	tun        *tuntest.ChannelTUN // tuntap device to send/receive packets
+	tun        *tuntest.ChannelTUN // TUN device to send/receive packets
 	tsTun      *tstun.TUN          // wrapped tun that implements filtering and wgengine hooks
 	dev        *device.Device      // the wireguard-go Device that connects the previous things
 }
@@ -141,6 +145,7 @@ func newMagicStack(t *testing.T, logf logger.Logf, l nettype.PacketListener, der
 		EndpointsFunc: func(eps []string) {
 			epCh <- eps
 		},
+		SimulatedNetwork: l != nettype.Std{},
 	})
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
@@ -374,7 +379,7 @@ collectEndpoints:
 
 func pickPort(t *testing.T) uint16 {
 	t.Helper()
-	conn, err := net.ListenPacket("udp4", ":0")
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +788,8 @@ func testActiveDiscovery(t *testing.T, d *devices) {
 
 	start := time.Now()
 	logf := func(msg string, args ...interface{}) {
-		msg = fmt.Sprintf("%s: %s", time.Since(start), msg)
+		t.Helper()
+		msg = fmt.Sprintf("%s: %s", time.Since(start).Truncate(time.Microsecond), msg)
 		tlogf(msg, args...)
 	}
 
@@ -811,7 +817,8 @@ func testActiveDiscovery(t *testing.T, d *devices) {
 
 	mustDirect := func(m1, m2 *magicStack) {
 		lastLog := time.Now().Add(-time.Minute)
-		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		// See https://github.com/tailscale/tailscale/issues/654 for a discussion of this deadline.
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 			pst := m1.Status().Peer[m2.Public()]
 			if pst.CurAddr != "" {
 				logf("direct link %s->%s found with addr %s", m1, m2, pst.CurAddr)

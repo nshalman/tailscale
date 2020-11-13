@@ -7,30 +7,25 @@
 package tsdns
 
 import (
-	"bytes"
-	"context"
 	"encoding/hex"
 	"errors"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
-	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
 )
 
-// maxResponseSize is the maximum size of a response from a Resolver.
-const maxResponseSize = 512
+// maxResponseBytes is the maximum size of a response from a Resolver.
+const maxResponseBytes = 512
 
-// queueSize is the maximal number of DNS requests that can be pending at a time.
+// queueSize is the maximal number of DNS requests that can await polling.
 // If EnqueueRequest is called when this many requests are already pending,
 // the request will be dropped to avoid blocking the caller.
-const queueSize = 8
-
-// delegateTimeout is the maximal amount of time Resolver will wait
-// for upstream nameservers to process a query.
-const delegateTimeout = 5 * time.Second
+const queueSize = 64
 
 // defaultTTL is the TTL of all responses from Resolver.
 const defaultTTL = 600 * time.Second
@@ -39,12 +34,12 @@ const defaultTTL = 600 * time.Second
 var ErrClosed = errors.New("closed")
 
 var (
-	errAllFailed      = errors.New("all upstream nameservers failed")
 	errFullQueue      = errors.New("request queue full")
-	errNoNameservers  = errors.New("no upstream nameservers set")
 	errMapNotSet      = errors.New("domain map not set")
+	errNotForwarding  = errors.New("forwarding disabled")
 	errNotImplemented = errors.New("query type not implemented")
 	errNotQuery       = errors.New("not a DNS query")
+	errNotOurName     = errors.New("not a Tailscale DNS name")
 )
 
 // Packet represents a DNS payload together with the address of its origin.
@@ -63,57 +58,64 @@ type Packet struct {
 // it delegates to upstream nameservers if any are set.
 type Resolver struct {
 	logf logger.Logf
-
-	// The asynchronous interface is due to the fact that resolution may potentially
-	// block for a long time (if the upstream nameserver is slow to reach).
+	// forwarder forwards requests to upstream nameservers.
+	forwarder *forwarder
 
 	// queue is a buffered channel holding DNS requests queued for resolution.
 	queue chan Packet
-	// responses is an unbuffered channel to which responses are sent.
+	// responses is an unbuffered channel to which responses are returned.
 	responses chan Packet
-	// errors is an unbuffered channel to which errors are sent.
+	// errors is an unbuffered channel to which errors are returned.
 	errors chan error
-	// closed notifies the poll goroutines to stop.
+	// closed signals all goroutines to stop.
 	closed chan struct{}
-	// pollGroup signals when all poll goroutines have stopped.
-	pollGroup sync.WaitGroup
-
-	// rootDomain is <root> in <mynode>.<mydomain>.<root>.
-	rootDomain []byte
-
-	// dialer is the netns.Dialer used for delegation.
-	dialer netns.Dialer
+	// wg signals when all goroutines have stopped.
+	wg sync.WaitGroup
 
 	// mu guards the following fields from being updated while used.
 	mu sync.Mutex
 	// dnsMap is the map most recently received from the control server.
 	dnsMap *Map
-	// nameservers is the list of nameserver addresses that should be used
-	// if the received query is not for a Tailscale node.
-	// The addresses are strings of the form ip:port, as expected by Dial.
-	nameservers []string
+}
+
+// ResolverConfig is the set of configuration options for a Resolver.
+type ResolverConfig struct {
+	// Logf is the logger to use throughout the Resolver.
+	Logf logger.Logf
+	// Forward determines whether the resolver will forward packets to
+	// nameservers set with SetUpstreams if the domain name is not of a Tailscale node.
+	Forward bool
 }
 
 // NewResolver constructs a resolver associated with the given root domain.
 // The root domain must be in canonical form (with a trailing period).
-func NewResolver(logf logger.Logf, rootDomain string) *Resolver {
+func NewResolver(config ResolverConfig) *Resolver {
 	r := &Resolver{
-		logf:       logger.WithPrefix(logf, "tsdns: "),
-		queue:      make(chan Packet, queueSize),
-		responses:  make(chan Packet),
-		errors:     make(chan error),
-		closed:     make(chan struct{}),
-		rootDomain: []byte(rootDomain),
-		dialer:     netns.NewDialer(),
+		logf:      logger.WithPrefix(config.Logf, "tsdns: "),
+		queue:     make(chan Packet, queueSize),
+		responses: make(chan Packet),
+		errors:    make(chan error),
+		closed:    make(chan struct{}),
+	}
+
+	if config.Forward {
+		r.forwarder = newForwarder(r.logf, r.responses)
 	}
 
 	return r
 }
 
-func (r *Resolver) Start() {
-	// TODO(dmytro): spawn more than one goroutine? They block on delegation.
-	r.pollGroup.Add(1)
+func (r *Resolver) Start() error {
+	if r.forwarder != nil {
+		if err := r.forwarder.Start(); err != nil {
+			return err
+		}
+	}
+
+	r.wg.Add(1)
 	go r.poll()
+
+	return nil
 }
 
 // Close shuts down the resolver and ensures poll goroutines have exited.
@@ -126,7 +128,12 @@ func (r *Resolver) Close() {
 		// continue
 	}
 	close(r.closed)
-	r.pollGroup.Wait()
+
+	if r.forwarder != nil {
+		r.forwarder.Close()
+	}
+
+	r.wg.Wait()
 }
 
 // SetMap sets the resolver's DNS map, taking ownership of it.
@@ -138,14 +145,13 @@ func (r *Resolver) SetMap(m *Map) {
 	r.logf("map diff:\n%s", m.PrettyDiffFrom(oldMap))
 }
 
-// SetUpstreamNameservers sets the addresses of the resolver's
+// SetUpstreams sets the addresses of the resolver's
 // upstream nameservers, taking ownership of the argument.
-// The addresses should be strings of the form ip:port,
-// matching what Dial("udp", addr) expects as addr.
-func (r *Resolver) SetNameservers(nameservers []string) {
-	r.mu.Lock()
-	r.nameservers = nameservers
-	r.mu.Unlock()
+func (r *Resolver) SetUpstreams(upstreams []net.Addr) {
+	if r.forwarder != nil {
+		r.forwarder.setUpstreams(upstreams)
+	}
+	r.logf("set upstreams: %v", upstreams)
 }
 
 // EnqueueRequest places the given DNS request in the resolver's queue.
@@ -153,6 +159,8 @@ func (r *Resolver) SetNameservers(nameservers []string) {
 // If the queue is full, the request will be dropped and an error will be returned.
 func (r *Resolver) EnqueueRequest(request Packet) error {
 	select {
+	case <-r.closed:
+		return ErrClosed
 	case r.queue <- request:
 		return nil
 	default:
@@ -164,18 +172,19 @@ func (r *Resolver) EnqueueRequest(request Packet) error {
 // It blocks until a response is available and gives up ownership of the response payload.
 func (r *Resolver) NextResponse() (Packet, error) {
 	select {
+	case <-r.closed:
+		return Packet{}, ErrClosed
 	case resp := <-r.responses:
 		return resp, nil
 	case err := <-r.errors:
 		return Packet{}, err
-	case <-r.closed:
-		return Packet{}, ErrClosed
 	}
 }
 
-// Resolve maps a given domain name to the IP address of the host that owns it.
+// Resolve maps a given domain name to the IP address of the host that owns it,
+// if the IP address conforms to the DNS resource type given by tp (one of A, AAAA, ALL).
 // The domain name must be in canonical form (with a trailing period).
-func (r *Resolver) Resolve(domain string) (netaddr.IP, dns.RCode, error) {
+func (r *Resolver) Resolve(domain string, tp dns.Type) (netaddr.IP, dns.RCode, error) {
 	r.mu.Lock()
 	dnsMap := r.dnsMap
 	r.mu.Unlock()
@@ -184,11 +193,38 @@ func (r *Resolver) Resolve(domain string) (netaddr.IP, dns.RCode, error) {
 		return netaddr.IP{}, dns.RCodeServerFailure, errMapNotSet
 	}
 
+	anyHasSuffix := false
+	for _, rootDomain := range dnsMap.rootDomains {
+		if strings.HasSuffix(domain, rootDomain) {
+			anyHasSuffix = true
+			break
+		}
+	}
+	if !anyHasSuffix {
+		return netaddr.IP{}, dns.RCodeRefused, nil
+	}
+
 	addr, found := dnsMap.nameToIP[domain]
 	if !found {
 		return netaddr.IP{}, dns.RCodeNameError, nil
 	}
-	return addr, dns.RCodeSuccess, nil
+
+	// Refactoring note: this must happen after we check suffixes,
+	// otherwise we will respond with NOTIMP to requests that should be forwarded.
+	switch {
+	case tp == dns.TypeA || tp == dns.TypeALL:
+		if !addr.Is4() {
+			return netaddr.IP{}, dns.RCodeSuccess, nil
+		}
+		return addr, dns.RCodeSuccess, nil
+	case tp == dns.TypeAAAA || tp == dns.TypeALL:
+		if !addr.Is6() {
+			return netaddr.IP{}, dns.RCodeSuccess, nil
+		}
+		return addr, dns.RCodeSuccess, nil
+	default:
+		return netaddr.IP{}, dns.RCodeNotImplemented, errNotImplemented
+	}
 }
 
 // ResolveReverse returns the unique domain name that maps to the given address.
@@ -209,112 +245,48 @@ func (r *Resolver) ResolveReverse(ip netaddr.IP) (string, dns.RCode, error) {
 }
 
 func (r *Resolver) poll() {
-	defer r.pollGroup.Done()
+	defer r.wg.Done()
 
-	var (
-		packet Packet
-		err    error
-	)
+	var packet Packet
 	for {
 		select {
-		case packet = <-r.queue:
-			// continue
 		case <-r.closed:
 			return
+		case packet = <-r.queue:
+			// continue
 		}
 
-		packet.Payload, err = r.respond(packet.Payload)
+		out, err := r.respond(packet.Payload)
+
+		if err == errNotOurName {
+			if r.forwarder != nil {
+				err = r.forwarder.forward(packet)
+				if err == nil {
+					// forward will send response into r.responses, nothing to do.
+					continue
+				}
+			} else {
+				err = errNotForwarding
+			}
+		}
+
 		if err != nil {
 			select {
+			case <-r.closed:
+				return
 			case r.errors <- err:
 				// continue
-			case <-r.closed:
-				return
 			}
 		} else {
+			packet.Payload = out
 			select {
-			case r.responses <- packet:
-				// continue
 			case <-r.closed:
 				return
+			case r.responses <- packet:
+				// continue
 			}
 		}
 	}
-}
-
-// queryServer obtains a DNS response by querying the given server.
-func (r *Resolver) queryServer(ctx context.Context, server string, query []byte) ([]byte, error) {
-	conn, err := r.dialer.DialContext(ctx, "udp", server)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	// Interrupt the current operation when the context is cancelled.
-	go func() {
-		<-ctx.Done()
-		conn.SetDeadline(time.Unix(1, 0))
-	}()
-
-	_, err = conn.Write(query)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make([]byte, maxResponseSize)
-	n, err := conn.Read(out)
-	if err != nil {
-		return nil, err
-	}
-
-	return out[:n], nil
-}
-
-// delegate forwards the query to all upstream nameservers and returns the first response.
-func (r *Resolver) delegate(query []byte) ([]byte, error) {
-	r.mu.Lock()
-	nameservers := r.nameservers
-	r.mu.Unlock()
-
-	if len(nameservers) == 0 {
-		return nil, errNoNameservers
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), delegateTimeout)
-	defer cancel()
-
-	// Common case, don't spawn goroutines.
-	if len(nameservers) == 1 {
-		return r.queryServer(ctx, nameservers[0], query)
-	}
-
-	datach := make(chan []byte)
-	for _, server := range nameservers {
-		go func(s string) {
-			resp, err := r.queryServer(ctx, s, query)
-			// Only print errors not due to cancelation after first response.
-			if err != nil && ctx.Err() != context.Canceled {
-				r.logf("querying %s: %v", s, err)
-			}
-
-			datach <- resp
-		}(server)
-	}
-
-	var response []byte
-	for range nameservers {
-		cur := <-datach
-		if cur != nil && response == nil {
-			// Received first successful response
-			response = cur
-			cancel()
-		}
-	}
-
-	if response == nil {
-		return nil, errAllFailed
-	}
-	return response, nil
 }
 
 type response struct {
@@ -322,12 +294,12 @@ type response struct {
 	Question dns.Question
 	// Name is the response to a PTR query.
 	Name string
-	// IP is the response to an A, AAAA, or ANY query.
+	// IP is the response to an A, AAAA, or ALL query.
 	IP netaddr.IP
 }
 
 // parseQuery parses the query in given packet into a response struct.
-func (r *Resolver) parseQuery(query []byte, resp *response) error {
+func parseQuery(query []byte, resp *response) error {
 	var parser dns.Parser
 	var err error
 
@@ -433,7 +405,7 @@ func marshalResponse(resp *response) ([]byte, error) {
 	case dns.TypeA, dns.TypeAAAA, dns.TypeALL:
 		if resp.IP.Is4() {
 			err = marshalARecord(resp.Question.Name, resp.IP, &builder)
-		} else {
+		} else if resp.IP.Is6() {
 			err = marshalAAAARecord(resp.Question.Name, resp.IP, &builder)
 		}
 	case dns.TypePTR:
@@ -446,10 +418,54 @@ func marshalResponse(resp *response) ([]byte, error) {
 	return builder.Finish()
 }
 
-var (
-	rdnsv4Suffix = []byte(".in-addr.arpa.")
-	rdnsv6Suffix = []byte(".ip6.arpa.")
+const (
+	rdnsv4Suffix = ".in-addr.arpa."
+	rdnsv6Suffix = ".ip6.arpa."
 )
+
+// hasRDNSBonjourPrefix reports whether name has a Bonjour Service Prefix..
+//
+// https://tools.ietf.org/html/rfc6763 lists
+// "five special RR names" for Bonjour service discovery:
+//
+//   b._dns-sd._udp.<domain>.
+//  db._dns-sd._udp.<domain>.
+//   r._dns-sd._udp.<domain>.
+//  dr._dns-sd._udp.<domain>.
+//  lb._dns-sd._udp.<domain>.
+func hasRDNSBonjourPrefix(s string) bool {
+	// Even the shortest name containing a Bonjour prefix is long,
+	// so check length (cheap) and bail early if possible.
+	if len(s) < len("*._dns-sd._udp.0.0.0.0.in-addr.arpa.") {
+		return false
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot == -1 {
+		return false // shouldn't happen
+	}
+	switch s[:dot] {
+	case "b", "db", "r", "dr", "lb":
+	default:
+		return false
+	}
+
+	return strings.HasPrefix(s[dot:], "._dns-sd._udp.")
+}
+
+// rawNameToLower converts a raw DNS name to a string, lowercasing it.
+func rawNameToLower(name []byte) string {
+	var sb strings.Builder
+	sb.Grow(len(name))
+
+	for _, b := range name {
+		if 'A' <= b && b <= 'Z' {
+			b = b - 'A' + 'a'
+		}
+		sb.WriteByte(b)
+	}
+
+	return sb.String()
+}
 
 // ptrNameToIPv4 transforms a PTR name representing an IPv4 address to said address.
 // Such names are IPv4 labels in reverse order followed by .in-addr.arpa.
@@ -457,8 +473,8 @@ var (
 //   4.3.2.1.in-addr.arpa
 // is transformed to
 //   1.2.3.4
-func rdnsNameToIPv4(name []byte) (ip netaddr.IP, ok bool) {
-	name = bytes.TrimSuffix(name, rdnsv4Suffix)
+func rdnsNameToIPv4(name string) (ip netaddr.IP, ok bool) {
+	name = strings.TrimSuffix(name, rdnsv4Suffix)
 	ip, err := netaddr.ParseIP(string(name))
 	if err != nil {
 		return netaddr.IP{}, false
@@ -476,11 +492,11 @@ func rdnsNameToIPv4(name []byte) (ip netaddr.IP, ok bool) {
 //   b.a.9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.
 // is transformed to
 //   2001:db8::567:89ab
-func rdnsNameToIPv6(name []byte) (ip netaddr.IP, ok bool) {
+func rdnsNameToIPv6(name string) (ip netaddr.IP, ok bool) {
 	var b [32]byte
 	var ipb [16]byte
 
-	name = bytes.TrimSuffix(name, rdnsv6Suffix)
+	name = strings.TrimSuffix(name, rdnsv6Suffix)
 	// 32 nibbles and 31 dots between them.
 	if len(name) != 63 {
 		return netaddr.IP{}, false
@@ -514,95 +530,72 @@ func rdnsNameToIPv6(name []byte) (ip netaddr.IP, ok bool) {
 
 // respondReverse returns a DNS response to a PTR query.
 // It is assumed that resp.Question is populated by respond before this is called.
-func (r *Resolver) respondReverse(query []byte, resp *response) ([]byte, error) {
-	name := resp.Question.Name.Data[:resp.Question.Name.Length]
-
-	shouldDelegate := false
+func (r *Resolver) respondReverse(query []byte, name string, resp *response) ([]byte, error) {
+	if hasRDNSBonjourPrefix(name) {
+		return nil, errNotOurName
+	}
 
 	var ip netaddr.IP
 	var ok bool
-	var err error
 	switch {
-	case bytes.HasSuffix(name, rdnsv4Suffix):
+	case strings.HasSuffix(name, rdnsv4Suffix):
 		ip, ok = rdnsNameToIPv4(name)
-	case bytes.HasSuffix(name, rdnsv6Suffix):
+	case strings.HasSuffix(name, rdnsv6Suffix):
 		ip, ok = rdnsNameToIPv6(name)
 	default:
-		shouldDelegate = true
+		return nil, errNotOurName
 	}
 
 	// It is more likely that we failed in parsing the name than that it is actually malformed.
 	// To avoid frustrating users, just log and delegate.
 	if !ok {
-		// Without this conversion, escape analysis rules that resp escapes.
-		r.logf("parsing rdns: malformed name: %s", resp.Question.Name.String())
-		shouldDelegate = true
+		r.logf("parsing rdns: malformed name: %s", name)
+		return nil, errNotOurName
 	}
 
-	if !shouldDelegate {
-		resp.Name, resp.Header.RCode, err = r.ResolveReverse(ip)
-		if err != nil {
-			r.logf("resolving rdns: %v", ip, err)
-		}
-		shouldDelegate = (resp.Header.RCode == dns.RCodeNameError)
+	var err error
+	resp.Name, resp.Header.RCode, err = r.ResolveReverse(ip)
+	if err != nil {
+		r.logf("resolving rdns: %v", ip, err)
 	}
-
-	if shouldDelegate {
-		out, err := r.delegate(query)
-		if err != nil {
-			r.logf("delegating rdns: %v", err)
-			resp.Header.RCode = dns.RCodeServerFailure
-			return marshalResponse(resp)
-		}
-		return out, nil
+	if resp.Header.RCode == dns.RCodeNameError {
+		return nil, errNotOurName
 	}
 
 	return marshalResponse(resp)
 }
 
-// respond returns a DNS response to query.
+// respond returns a DNS response to query if it can be resolved locally.
+// Otherwise, it returns errNotOurName.
 func (r *Resolver) respond(query []byte) ([]byte, error) {
 	resp := new(response)
 
 	// ParseQuery is sufficiently fast to run on every DNS packet.
 	// This is considerably simpler than extracting the name by hand
 	// to shave off microseconds in case of delegation.
-	err := r.parseQuery(query, resp)
+	err := parseQuery(query, resp)
 	// We will not return this error: it is the sender's fault.
 	if err != nil {
 		r.logf("parsing query: %v", err)
 		resp.Header.RCode = dns.RCodeFormatError
 		return marshalResponse(resp)
 	}
+	rawName := resp.Question.Name.Data[:resp.Question.Name.Length]
+	name := rawNameToLower(rawName)
 
 	// Always try to handle reverse lookups; delegate inside when not found.
-	// This way, queries for exitent nodes do not leak,
+	// This way, queries for existent nodes do not leak,
 	// but we behave gracefully if non-Tailscale nodes exist in CGNATRange.
 	if resp.Question.Type == dns.TypePTR {
-		return r.respondReverse(query, resp)
+		return r.respondReverse(query, name, resp)
 	}
 
-	// Delegate forward lookups when not a subdomain of rootDomain.
-	// We do this on bytes because Name.String() allocates.
-	rawName := resp.Question.Name.Data[:resp.Question.Name.Length]
-	if !bytes.HasSuffix(rawName, r.rootDomain) {
-		out, err := r.delegate(query)
-		if err != nil {
-			r.logf("delegating: %v", err)
-			resp.Header.RCode = dns.RCodeServerFailure
-			return marshalResponse(resp)
-		}
-		return out, nil
+	resp.IP, resp.Header.RCode, err = r.Resolve(name, resp.Question.Type)
+	// This return code is special: it requests forwarding.
+	if resp.Header.RCode == dns.RCodeRefused {
+		return nil, errNotOurName
 	}
 
-	switch resp.Question.Type {
-	case dns.TypeA, dns.TypeAAAA, dns.TypeALL:
-		name := resp.Question.Name.String()
-		resp.IP, resp.Header.RCode, err = r.Resolve(name)
-	default:
-		resp.Header.RCode = dns.RCodeNotImplemented
-		err = errNotImplemented
-	}
 	// We will not return this error: it is the sender's fault.
 	if err != nil {
 		r.logf("resolving: %v", err)

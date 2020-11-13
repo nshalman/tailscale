@@ -7,6 +7,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/peterbourgon/ff/v2/ffcli"
 	"github.com/tailscale/wireguard-go/wgcfg"
@@ -22,17 +24,9 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/version"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/router"
 )
-
-// globalStateKey is the ipn.StateKey that tailscaled loads on
-// startup.
-//
-// We have to support multiple state keys for other OSes (Windows in
-// particular), but right now Unix daemons run with a single
-// node-global state. To keep open the option of having per-user state
-// later, the global state key doesn't look like a username.
-const globalStateKey = "_daemon"
 
 var upCmd = &ffcli.Command{
 	Name:       "up",
@@ -53,20 +47,27 @@ specify any flags, options are reset to their default.
 		upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
 		upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "install host routes to other Tailscale nodes")
 		upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
+		upf.BoolVar(&upArgs.forceReauth, "force-reauth", false, "force reauthentication")
 		upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "ACL tags to request (comma-separated, e.g. eng,montreal,ssh)")
 		upf.StringVar(&upArgs.authKey, "authkey", "", "node authorization key")
 		upf.StringVar(&upArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
-		upf.BoolVar(&upArgs.enableDERP, "enable-derp", true, "enable the use of DERP servers")
 		if runtime.GOOS == "linux" || isBSD(runtime.GOOS) || version.OS() == "macOS" {
 			upf.StringVar(&upArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. 10.0.0.0/8,192.168.0.0/24)")
 		}
 		if runtime.GOOS == "linux" {
-			upf.BoolVar(&upArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with -advertise-routes")
-			upf.StringVar(&upArgs.netfilterMode, "netfilter-mode", "on", "netfilter mode (one of on, nodivert, off)")
+			upf.BoolVar(&upArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
+			upf.StringVar(&upArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
 		}
 		return upf
 	})(),
 	Exec: runUp,
+}
+
+func defaultNetfilterMode() string {
+	if distro.Get() == distro.Synology {
+		return "off"
+	}
+	return "on"
 }
 
 var upArgs struct {
@@ -75,9 +76,9 @@ var upArgs struct {
 	acceptDNS       bool
 	singleRoutes    bool
 	shieldsUp       bool
+	forceReauth     bool
 	advertiseRoutes string
 	advertiseTags   string
-	enableDERP      bool
 	snat            bool
 	netfilterMode   string
 	authKey         string
@@ -148,6 +149,19 @@ func runUp(ctx context.Context, args []string) error {
 		log.Fatalf("too many non-flag arguments: %q", args)
 	}
 
+	if distro.Get() == distro.Synology {
+		notSupported := "not yet supported on Synology; see https://github.com/tailscale/tailscale/issues/451"
+		if upArgs.advertiseRoutes != "" {
+			return errors.New("--advertise-routes is " + notSupported)
+		}
+		if upArgs.acceptRoutes {
+			return errors.New("--accept-routes is " + notSupported)
+		}
+		if upArgs.netfilterMode != "off" {
+			return errors.New("--netfilter-mode values besides \"off\" " + notSupported)
+		}
+	}
+
 	var routes []wgcfg.CIDR
 	if upArgs.advertiseRoutes != "" {
 		advroutes := strings.Split(upArgs.advertiseRoutes, ",")
@@ -191,8 +205,9 @@ func runUp(ctx context.Context, args []string) error {
 	prefs.AdvertiseRoutes = routes
 	prefs.AdvertiseTags = tags
 	prefs.NoSNAT = !upArgs.snat
-	prefs.DisableDERP = !upArgs.enableDERP
 	prefs.Hostname = upArgs.hostname
+	prefs.ForceDaemon = (runtime.GOOS == "windows")
+
 	if runtime.GOOS == "linux" {
 		switch upArgs.netfilterMode {
 		case "on":
@@ -212,10 +227,13 @@ func runUp(ctx context.Context, args []string) error {
 	defer cancel()
 
 	var printed bool
+	var loginOnce sync.Once
+	startLoginInteractive := func() { loginOnce.Do(func() { bc.StartLoginInteractive() }) }
 
 	bc.SetPrefs(prefs)
+
 	opts := ipn.Options{
-		StateKey: globalStateKey,
+		StateKey: ipn.GlobalDaemonStateKey,
 		AuthKey:  upArgs.authKey,
 		Notify: func(n ipn.Notify) {
 			if n.ErrMessage != nil {
@@ -225,7 +243,7 @@ func runUp(ctx context.Context, args []string) error {
 				switch *s {
 				case ipn.NeedsLogin:
 					printed = true
-					bc.StartLoginInteractive()
+					startLoginInteractive()
 				case ipn.NeedsMachineAuth:
 					printed = true
 					fmt.Fprintf(os.Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s/admin/machines\n\n", upArgs.server)
@@ -243,6 +261,22 @@ func runUp(ctx context.Context, args []string) error {
 			}
 		},
 	}
+
+	// On Windows, we still run in mostly the "legacy" way that
+	// predated the server's StateStore. That is, we send an empty
+	// StateKey and send the prefs directly. Although the Windows
+	// supports server mode, though, the transition to StateStore
+	// is only half complete. Only server mode uses it, and the
+	// Windows service (~tailscaled) is the one that computes the
+	// StateKey based on the connection idenity. So for now, just
+	// do as the Windows GUI's always done:
+	if runtime.GOOS == "windows" {
+		// The Windows service will set this as needed based
+		// on our connection's identity.
+		opts.StateKey = ""
+		opts.Prefs = prefs
+	}
+
 	// We still have to Start right now because it's the only way to
 	// set up notifications and whatnot. This causes a bunch of churn
 	// every time the CLI touches anything.
@@ -251,6 +285,10 @@ func runUp(ctx context.Context, args []string) error {
 	// ephemeral frontends that read/modify/write state, once
 	// Windows/Mac state is moved into backend.
 	bc.Start(opts)
+	if upArgs.forceReauth {
+		printed = true
+		startLoginInteractive()
+	}
 	pump(ctx, bc, c)
 
 	return nil

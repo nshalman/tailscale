@@ -7,11 +7,13 @@ package tsdns
 import (
 	"bytes"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 
 	dns "golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
+	"tailscale.com/tstest"
 )
 
 var testipv4 = netaddr.IPv4(1, 2, 3, 4)
@@ -24,9 +26,10 @@ var testipv6 = netaddr.IPv6Raw([16]byte{
 
 var dnsMap = NewMap(
 	map[string]netaddr.IP{
-		"test1.ipn.dev": testipv4,
-		"test2.ipn.dev": testipv6,
+		"test1.ipn.dev.": testipv4,
+		"test2.ipn.dev.": testipv6,
 	},
+	[]string{"ipn.dev."},
 )
 
 func dnspacket(domain string, tp dns.Type) []byte {
@@ -45,49 +48,64 @@ func dnspacket(domain string, tp dns.Type) []byte {
 	return payload
 }
 
-func extractipcode(response []byte) (netaddr.IP, dns.RCode, error) {
-	var ip netaddr.IP
+type dnsResponse struct {
+	ip    netaddr.IP
+	name  string
+	rcode dns.RCode
+}
+
+func unpackResponse(payload []byte) (dnsResponse, error) {
+	var response dnsResponse
 	var parser dns.Parser
 
-	h, err := parser.Start(response)
+	h, err := parser.Start(payload)
 	if err != nil {
-		return ip, 0, err
+		return response, err
 	}
 
 	if !h.Response {
-		return ip, 0, errors.New("not a response")
+		return response, errors.New("not a response")
 	}
-	if h.RCode != dns.RCodeSuccess {
-		return ip, h.RCode, nil
+
+	response.rcode = h.RCode
+	if response.rcode != dns.RCodeSuccess {
+		return response, nil
 	}
 
 	err = parser.SkipAllQuestions()
 	if err != nil {
-		return ip, 0, err
+		return response, err
 	}
 
 	ah, err := parser.AnswerHeader()
 	if err != nil {
-		return ip, 0, err
+		return response, err
 	}
+
 	switch ah.Type {
 	case dns.TypeA:
 		res, err := parser.AResource()
 		if err != nil {
-			return ip, 0, err
+			return response, err
 		}
-		ip = netaddr.IPv4(res.A[0], res.A[1], res.A[2], res.A[3])
+		response.ip = netaddr.IPv4(res.A[0], res.A[1], res.A[2], res.A[3])
 	case dns.TypeAAAA:
 		res, err := parser.AAAAResource()
 		if err != nil {
-			return ip, 0, err
+			return response, err
 		}
-		ip = netaddr.IPv6Raw(res.AAAA)
+		response.ip = netaddr.IPv6Raw(res.AAAA)
+	case dns.TypeNS:
+		res, err := parser.NSResource()
+		if err != nil {
+			return response, err
+		}
+		response.name = res.NS.String()
 	default:
-		return ip, 0, errors.New("type not in {A, AAAA}")
+		return response, errors.New("type not in {A, AAAA, NS}")
 	}
 
-	return ip, h.RCode, nil
+	return response, nil
 }
 
 func syncRespond(r *Resolver, query []byte) ([]byte, error) {
@@ -120,8 +138,7 @@ func TestRDNSNameToIPv4(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			name := []byte(tt.input)
-			ip, ok := rdnsNameToIPv4(name)
+			ip, ok := rdnsNameToIPv4(tt.input)
 			if ok != tt.wantOK {
 				t.Errorf("ok = %v; want %v", ok, tt.wantOK)
 			} else if ok && ip != tt.wantIP {
@@ -166,8 +183,7 @@ func TestRDNSNameToIPv6(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			name := []byte(tt.input)
-			ip, ok := rdnsNameToIPv6(name)
+			ip, ok := rdnsNameToIPv6(tt.input)
 			if ok != tt.wantOK {
 				t.Errorf("ok = %v; want %v", ok, tt.wantOK)
 			} else if ok && ip != tt.wantIP {
@@ -178,25 +194,31 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func TestResolve(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
-		name   string
-		domain string
-		ip     netaddr.IP
-		code   dns.RCode
+		name  string
+		qname string
+		qtype dns.Type
+		ip    netaddr.IP
+		code  dns.RCode
 	}{
-		{"ipv4", "test1.ipn.dev.", testipv4, dns.RCodeSuccess},
-		{"ipv6", "test2.ipn.dev.", testipv6, dns.RCodeSuccess},
-		{"nxdomain", "test3.ipn.dev.", netaddr.IP{}, dns.RCodeNameError},
-		{"foreign domain", "google.com.", netaddr.IP{}, dns.RCodeNameError},
+		{"ipv4", "test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess},
+		{"ipv6", "test2.ipn.dev.", dns.TypeAAAA, testipv6, dns.RCodeSuccess},
+		{"no-ipv6", "test1.ipn.dev.", dns.TypeAAAA, netaddr.IP{}, dns.RCodeSuccess},
+		{"nxdomain", "test3.ipn.dev.", dns.TypeA, netaddr.IP{}, dns.RCodeNameError},
+		{"foreign domain", "google.com.", dns.TypeA, netaddr.IP{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip, code, err := r.Resolve(tt.domain)
+			ip, code, err := r.Resolve(tt.qname, tt.qtype)
 			if err != nil {
 				t.Errorf("err = %v; want nil", err)
 			}
@@ -212,9 +234,13 @@ func TestResolve(t *testing.T) {
 }
 
 func TestResolveReverse(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name string
@@ -244,7 +270,10 @@ func TestResolveReverse(t *testing.T) {
 }
 
 func TestDelegate(t *testing.T) {
-	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6))
+	rc := tstest.NewResourceCheck()
+	defer rc.Assert(t)
+
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
 	dnsHandleFunc("nxdomain.site.", resolveToNXDOMAIN)
 
 	v4server, v4errch := serveDNS("127.0.0.1:0")
@@ -271,49 +300,157 @@ func TestDelegate(t *testing.T) {
 		return
 	}
 
-	r := NewResolver(t.Logf, "ipn.dev")
-	r.SetNameservers([]string{
-		v4server.PacketConn.LocalAddr().String(),
-		v6server.PacketConn.LocalAddr().String(),
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: true})
+	r.SetMap(dnsMap)
+	r.SetUpstreams([]net.Addr{
+		v4server.PacketConn.LocalAddr(),
+		v6server.PacketConn.LocalAddr(),
 	})
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
-		name  string
-		query []byte
-		ip    netaddr.IP
-		code  dns.RCode
+		title    string
+		query    []byte
+		response dnsResponse
 	}{
-		{"ipv4", dnspacket("test.site.", dns.TypeA), testipv4, dns.RCodeSuccess},
-		{"ipv6", dnspacket("test.site.", dns.TypeAAAA), testipv6, dns.RCodeSuccess},
-		{"nxdomain", dnspacket("nxdomain.site.", dns.TypeA), netaddr.IP{}, dns.RCodeNameError},
+		{
+			"ipv4",
+			dnspacket("test.site.", dns.TypeA),
+			dnsResponse{ip: testipv4, rcode: dns.RCodeSuccess},
+		},
+		{
+			"ipv6",
+			dnspacket("test.site.", dns.TypeAAAA),
+			dnsResponse{ip: testipv6, rcode: dns.RCodeSuccess},
+		},
+		{
+			"ns",
+			dnspacket("test.site.", dns.TypeNS),
+			dnsResponse{name: "dns.test.site.", rcode: dns.RCodeSuccess},
+		},
+		{
+			"nxdomain",
+			dnspacket("nxdomain.site.", dns.TypeA),
+			dnsResponse{rcode: dns.RCodeNameError},
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resp, err := syncRespond(r, tt.query)
+		t.Run(tt.title, func(t *testing.T) {
+			payload, err := syncRespond(r, tt.query)
 			if err != nil {
 				t.Errorf("err = %v; want nil", err)
 				return
 			}
-			ip, code, err := extractipcode(resp)
+			response, err := unpackResponse(payload)
 			if err != nil {
-				t.Errorf("extract: err = %v; want nil (in %x)", err, resp)
+				t.Errorf("extract: err = %v; want nil (in %x)", err, payload)
 				return
 			}
-			if code != tt.code {
-				t.Errorf("code = %v; want %v", code, tt.code)
+			if response.rcode != tt.response.rcode {
+				t.Errorf("rcode = %v; want %v", response.rcode, tt.response.rcode)
 			}
-			if ip != tt.ip {
-				t.Errorf("ip = %v; want %v", ip, tt.ip)
+			if response.ip != tt.response.ip {
+				t.Errorf("ip = %v; want %v", response.ip, tt.response.ip)
+			}
+			if response.name != tt.response.name {
+				t.Errorf("name = %v; want %v", response.name, tt.response.name)
 			}
 		})
 	}
 }
 
+func TestDelegateCollision(t *testing.T) {
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
+
+	server, errch := serveDNS("127.0.0.1:0")
+	defer func() {
+		if err := <-errch; err != nil {
+			t.Errorf("server error: %v", err)
+		}
+	}()
+
+	if server == nil {
+		return
+	}
+	defer server.Shutdown()
+
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: true})
+	r.SetMap(dnsMap)
+	r.SetUpstreams([]net.Addr{server.PacketConn.LocalAddr()})
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
+
+	packets := []struct {
+		qname string
+		qtype dns.Type
+		addr  netaddr.IPPort
+	}{
+		{"test.site.", dns.TypeA, netaddr.IPPort{IP: netaddr.IPv4(1, 1, 1, 1), Port: 1001}},
+		{"test.site.", dns.TypeAAAA, netaddr.IPPort{IP: netaddr.IPv4(1, 1, 1, 1), Port: 1002}},
+	}
+
+	// packets will have the same dns txid.
+	for _, p := range packets {
+		payload := dnspacket(p.qname, p.qtype)
+		req := Packet{Payload: payload, Addr: p.addr}
+		err := r.EnqueueRequest(req)
+		if err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Despite the txid collision, the answer(s) should still match the query.
+	resp, err := r.NextResponse()
+	if err != nil {
+		t.Error(err)
+	}
+
+	var p dns.Parser
+	_, err = p.Start(resp.Payload)
+	if err != nil {
+		t.Error(err)
+	}
+	err = p.SkipAllQuestions()
+	if err != nil {
+		t.Error(err)
+	}
+	ans, err := p.AllAnswers()
+	if err != nil {
+		t.Error(err)
+	}
+
+	var wantType dns.Type
+	switch ans[0].Body.(type) {
+	case *dns.AResource:
+		wantType = dns.TypeA
+	case *dns.AAAAResource:
+		wantType = dns.TypeAAAA
+	default:
+		t.Errorf("unexpected answer type: %T", ans[0].Body)
+	}
+
+	for _, p := range packets {
+		if p.qtype == wantType && p.addr != resp.Addr {
+			t.Errorf("addr = %v; want %v", resp.Addr, p.addr)
+		}
+	}
+}
+
 func TestConcurrentSetMap(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
-	r.Start()
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: false})
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// This is purely to ensure that Resolve does not race with SetMap.
 	var wg sync.WaitGroup
@@ -324,22 +461,41 @@ func TestConcurrentSetMap(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		r.Resolve("test1.ipn.dev")
+		r.Resolve("test1.ipn.dev", dns.TypeA)
 	}()
 	wg.Wait()
 }
 
-func TestConcurrentSetNameservers(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
-	r.Start()
-	packet := dnspacket("google.com.", dns.TypeA)
+func TestConcurrentSetUpstreams(t *testing.T) {
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
 
-	// This is purely to ensure that delegation does not race with SetNameservers.
+	server, errch := serveDNS("127.0.0.1:0")
+	defer func() {
+		if err := <-errch; err != nil {
+			t.Errorf("server error: %v", err)
+		}
+	}()
+
+	if server == nil {
+		return
+	}
+	defer server.Shutdown()
+
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: true})
+	r.SetMap(dnsMap)
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
+
+	packet := dnspacket("test.site.", dns.TypeA)
+	// This is purely to ensure that delegation does not race with SetUpstreams.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r.SetNameservers([]string{"9.9.9.9:53"})
+		r.SetUpstreams([]net.Addr{server.PacketConn.LocalAddr()})
 	}()
 	go func() {
 		defer wg.Done()
@@ -348,7 +504,24 @@ func TestConcurrentSetNameservers(t *testing.T) {
 	wg.Wait()
 }
 
-var validIPv4Response = []byte{
+var allResponse = []byte{
+	0x00, 0x00, // transaction id: 0
+	0x84, 0x00, // flags: response, authoritative, no error
+	0x00, 0x01, // one question
+	0x00, 0x01, // one answer
+	0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+	// Question:
+	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
+	0x00, 0xff, 0x00, 0x01, // type ALL, class IN
+	// Answer:
+	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
+	0x00, 0x01, 0x00, 0x01, // type A, class IN
+	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x04, // length: 4 bytes
+	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
+}
+
+var ipv4Response = []byte{
 	0x00, 0x00, // transaction id: 0
 	0x84, 0x00, // flags: response, authoritative, no error
 	0x00, 0x01, // one question
@@ -365,7 +538,7 @@ var validIPv4Response = []byte{
 	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
 }
 
-var validIPv6Response = []byte{
+var ipv6Response = []byte{
 	0x00, 0x00, // transaction id: 0
 	0x84, 0x00, // flags: response, authoritative, no error
 	0x00, 0x01, // one question
@@ -383,7 +556,24 @@ var validIPv6Response = []byte{
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0xb, 0xc, 0xd, 0xe, 0xf,
 }
 
-var validPTRResponse = []byte{
+var ipv4UppercaseResponse = []byte{
+	0x00, 0x00, // transaction id: 0
+	0x84, 0x00, // flags: response, authoritative, no error
+	0x00, 0x01, // one question
+	0x00, 0x01, // one answer
+	0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+	// Question:
+	0x05, 0x54, 0x45, 0x53, 0x54, 0x31, 0x03, 0x49, 0x50, 0x4e, 0x03, 0x44, 0x45, 0x56, 0x00, // name
+	0x00, 0x01, 0x00, 0x01, // type A, class IN
+	// Answer:
+	0x05, 0x54, 0x45, 0x53, 0x54, 0x31, 0x03, 0x49, 0x50, 0x4e, 0x03, 0x44, 0x45, 0x56, 0x00, // name
+	0x00, 0x01, 0x00, 0x01, // type A, class IN
+	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x04, // length: 4 bytes
+	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
+}
+
+var ptrResponse = []byte{
 	0x00, 0x00, // transaction id: 0
 	0x84, 0x00, // flags: response, authoritative, no error
 	0x00, 0x01, // one question
@@ -414,10 +604,25 @@ var nxdomainResponse = []byte{
 	0x00, 0x01, 0x00, 0x01, // type A, class IN
 }
 
+var emptyResponse = []byte{
+	0x00, 0x00, // transaction id: 0
+	0x84, 0x00, // flags: response, authoritative, no error
+	0x00, 0x01, // one question
+	0x00, 0x00, // no answers
+	0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+	// Question:
+	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
+	0x00, 0x1c, 0x00, 0x01, // type AAAA, class IN
+}
+
 func TestFull(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// One full packet and one error packet
 	tests := []struct {
@@ -425,10 +630,13 @@ func TestFull(t *testing.T) {
 		request  []byte
 		response []byte
 	}{
-		{"ipv4", dnspacket("test1.ipn.dev.", dns.TypeA), validIPv4Response},
-		{"ipv6", dnspacket("test2.ipn.dev.", dns.TypeAAAA), validIPv6Response},
-		{"ptr", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR), validPTRResponse},
-		{"error", dnspacket("test3.ipn.dev.", dns.TypeA), nxdomainResponse},
+		{"all", dnspacket("test1.ipn.dev.", dns.TypeALL), allResponse},
+		{"ipv4", dnspacket("test1.ipn.dev.", dns.TypeA), ipv4Response},
+		{"ipv6", dnspacket("test2.ipn.dev.", dns.TypeAAAA), ipv6Response},
+		{"no-ipv6", dnspacket("test1.ipn.dev.", dns.TypeAAAA), emptyResponse},
+		{"upper", dnspacket("TEST1.IPN.DEV.", dns.TypeA), ipv4UppercaseResponse},
+		{"ptr", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR), ptrResponse},
+		{"nxdomain", dnspacket("test3.ipn.dev.", dns.TypeA), nxdomainResponse},
 	}
 
 	for _, tt := range tests {
@@ -445,9 +653,13 @@ func TestFull(t *testing.T) {
 }
 
 func TestAllocs(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// It is seemingly pointless to test allocs in the delegate path,
 	// as dialer.Dial -> Read -> Write alone comprise 12 allocs.
@@ -456,8 +668,8 @@ func TestAllocs(t *testing.T) {
 		query []byte
 		want  int
 	}{
-		// The only alloc is the slice created by dns.NewBuilder.
-		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA), 1},
+		// Name lowercasing and response slice created by dns.NewBuilder.
+		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA), 2},
 		// 3 extra allocs in rdnsNameToIPv4 and one in marshalPTRRecord (dns.NewName).
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR), 5},
 	}
@@ -472,10 +684,52 @@ func TestAllocs(t *testing.T) {
 	}
 }
 
+func TestTrimRDNSBonjourPrefix(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"b._dns-sd._udp.0.10.20.172.in-addr.arpa.", true},
+		{"db._dns-sd._udp.0.10.20.172.in-addr.arpa.", true},
+		{"r._dns-sd._udp.0.10.20.172.in-addr.arpa.", true},
+		{"dr._dns-sd._udp.0.10.20.172.in-addr.arpa.", true},
+		{"lb._dns-sd._udp.0.10.20.172.in-addr.arpa.", true},
+		{"qq._dns-sd._udp.0.10.20.172.in-addr.arpa.", false},
+		{"0.10.20.172.in-addr.arpa.", false},
+		{"i-have-no-dot", false},
+	}
+
+	for _, test := range tests {
+		got := hasRDNSBonjourPrefix(test.in)
+		if got != test.want {
+			t.Errorf("trimRDNSBonjourPrefix(%q) = %v, want %v", test.in, got, test.want)
+		}
+	}
+}
+
 func BenchmarkFull(b *testing.B) {
-	r := NewResolver(b.Logf, "ipn.dev.")
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
+
+	server, errch := serveDNS("127.0.0.1:0")
+	defer func() {
+		if err := <-errch; err != nil {
+			b.Errorf("server error: %v", err)
+		}
+	}()
+
+	if server == nil {
+		return
+	}
+	defer server.Shutdown()
+
+	r := NewResolver(ResolverConfig{Logf: b.Logf, Forward: true})
 	r.SetMap(dnsMap)
-	r.Start()
+	r.SetUpstreams([]net.Addr{server.PacketConn.LocalAddr()})
+
+	if err := r.Start(); err != nil {
+		b.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name    string
@@ -483,7 +737,7 @@ func BenchmarkFull(b *testing.B) {
 	}{
 		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA)},
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR)},
-		{"nxdomain", dnspacket("test3.ipn.dev.", dns.TypeA)},
+		{"delegated", dnspacket("test.site.", dns.TypeA)},
 	}
 
 	for _, tt := range tests {

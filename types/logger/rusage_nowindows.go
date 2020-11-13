@@ -4,7 +4,7 @@
 
 // +build !windows,!illumos
 
-package wgengine
+package logger
 
 import (
 	"runtime"

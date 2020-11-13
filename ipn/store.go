@@ -5,9 +5,12 @@
 package ipn
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +21,30 @@ import (
 // ErrStateNotExist is returned by StateStore.ReadState when the
 // requested state ID doesn't exist.
 var ErrStateNotExist = errors.New("no state with given ID")
+
+const (
+	// MachineKeyStateKey is the key under which we store the machine key,
+	// in its wgcfg.PrivateKey.MarshalText representation.
+	MachineKeyStateKey = StateKey("_machinekey")
+
+	// GlobalDaemonStateKey is the ipn.StateKey that tailscaled
+	// loads on startup.
+	//
+	// We have to support multiple state keys for other OSes (Windows in
+	// particular), but right now Unix daemons run with a single
+	// node-global state. To keep open the option of having per-user state
+	// later, the global state key doesn't look like a username.
+	GlobalDaemonStateKey = StateKey("_daemon")
+
+	// ServerModeStartKey's value, if non-empty, is the value of a
+	// StateKey containing the prefs to start with which to start the
+	// server.
+	//
+	// For example, the value might be "user-1234", meaning the
+	// the server should start with the Prefs JSON loaded from
+	// StateKey "user-1234".
+	ServerModeStartKey = StateKey("server-mode-start-key")
+)
 
 // StateStore persists state, and produces it back on request.
 type StateStore interface {
@@ -33,6 +60,8 @@ type MemoryStore struct {
 	mu    sync.Mutex
 	cache map[StateKey][]byte
 }
+
+func (s *MemoryStore) String() string { return "MemoryStore" }
 
 // ReadState implements the StateStore interface.
 func (s *MemoryStore) ReadState(id StateKey) ([]byte, error) {
@@ -67,9 +96,19 @@ type FileStore struct {
 	cache map[StateKey][]byte
 }
 
+func (s *FileStore) String() string { return fmt.Sprintf("FileStore(%q)", s.path) }
+
 // NewFileStore returns a new file store that persists to path.
 func NewFileStore(path string) (*FileStore, error) {
 	bs, err := ioutil.ReadFile(path)
+
+	// Treat an empty file as a missing file.
+	// (https://github.com/tailscale/tailscale/issues/895#issuecomment-723255589)
+	if err == nil && len(bs) == 0 {
+		log.Printf("ipn.NewFileStore(%q): file empty; treating it like a missing file [warning]", path)
+		err = os.ErrNotExist
+	}
+
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Write out an initial file, to verify that we can write
@@ -112,6 +151,9 @@ func (s *FileStore) ReadState(id StateKey) ([]byte, error) {
 func (s *FileStore) WriteState(id StateKey, bs []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if bytes.Equal(s.cache[id], bs) {
+		return nil
+	}
 	s.cache[id] = append([]byte(nil), bs...)
 	bs, err := json.MarshalIndent(s.cache, "", "  ")
 	if err != nil {

@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"tailscale.com/atomicfile"
@@ -18,44 +20,57 @@ import (
 	"tailscale.com/wgengine/router"
 )
 
+//go:generate go run tailscale.com/cmd/cloner -type=Prefs -output=prefs_clone.go
+
 // Prefs are the user modifiable settings of the Tailscale node agent.
 type Prefs struct {
 	// ControlURL is the URL of the control server to use.
 	ControlURL string
+
 	// RouteAll specifies whether to accept subnet and default routes
 	// advertised by other nodes on the Tailscale network.
 	RouteAll bool
+
 	// AllowSingleHosts specifies whether to install routes for each
 	// node IP on the tailscale network, in addition to a route for
 	// the whole network.
+	// This corresponds to the "tailscale up --host-routes" value,
+	// which defaults to true.
 	//
 	// TODO(danderson): why do we have this? It dumps a lot of stuff
 	// into the routing table, and a single network route _should_ be
 	// all that we need. But when I turn this off in my tailscaled,
 	// packets stop flowing. What's up with that?
 	AllowSingleHosts bool
+
 	// CorpDNS specifies whether to install the Tailscale network's
 	// DNS configuration, if it exists.
 	CorpDNS bool
+
 	// WantRunning indicates whether networking should be active on
 	// this node.
 	WantRunning bool
+
 	// ShieldsUp indicates whether to block all incoming connections,
 	// regardless of the control-provided packet filter. If false, we
 	// use the packet filter as provided. If true, we block incoming
 	// connections.
 	ShieldsUp bool
+
 	// AdvertiseTags specifies groups that this node wants to join, for
 	// purposes of ACL enforcement. These can be referenced from the ACL
 	// security policy. Note that advertising a tag doesn't guarantee that
 	// the control server will allow you to take on the rights for that
 	// tag.
 	AdvertiseTags []string
+
 	// Hostname is the hostname to use for identifying the node. If
 	// not set, os.Hostname is used.
 	Hostname string
+
 	// OSVersion overrides tailcfg.Hostinfo's OSVersion.
 	OSVersion string
+
 	// DeviceModel overrides tailcfg.Hostinfo's DeviceModel.
 	DeviceModel string
 
@@ -67,8 +82,17 @@ type Prefs struct {
 	// users narrow it down a bit.
 	NotepadURLs bool
 
-	// DisableDERP prevents DERP from being used.
-	DisableDERP bool
+	// ForceDaemon specifies whether a platform that normally
+	// operates in "client mode" (that is, requires an active user
+	// logged in with the GUI app running) should keep running after the
+	// GUI ends and/or the user logs out.
+	//
+	// The only current applicable platform is Windows. This
+	// forced Windows to go into "server mode" where Tailscale is
+	// running even with no users logged in. This might also be
+	// used for macOS in the future. This setting has no effect
+	// for Linux/etc, which always operate in daemon mode.
+	ForceDaemon bool `json:"ForceDaemon,omitempty"`
 
 	// The following block of options only have an effect on Linux.
 
@@ -76,6 +100,7 @@ type Prefs struct {
 	// Tailscale network as reachable through the current
 	// node.
 	AdvertiseRoutes []wgcfg.CIDR
+
 	// NoSNAT specifies whether to source NAT traffic going to
 	// destinations in AdvertiseRoutes. The default is to apply source
 	// NAT, which makes the traffic appear to come from the router
@@ -87,6 +112,7 @@ type Prefs struct {
 	//
 	// Linux-only.
 	NoSNAT bool
+
 	// NetfilterMode specifies how much to manage netfilter rules for
 	// Tailscale, if at all.
 	NetfilterMode router.NetfilterMode
@@ -102,16 +128,46 @@ type Prefs struct {
 // IsEmpty reports whether p is nil or pointing to a Prefs zero value.
 func (p *Prefs) IsEmpty() bool { return p == nil || p.Equals(&Prefs{}) }
 
-func (p *Prefs) Pretty() string {
-	var pp string
-	if p.Persist != nil {
-		pp = p.Persist.Pretty()
-	} else {
-		pp = "Persist=nil"
+func (p *Prefs) Pretty() string { return p.pretty(runtime.GOOS) }
+func (p *Prefs) pretty(goos string) string {
+	var sb strings.Builder
+	sb.WriteString("Prefs{")
+	fmt.Fprintf(&sb, "ra=%v ", p.RouteAll)
+	if !p.AllowSingleHosts {
+		sb.WriteString("mesh=false ")
 	}
-	return fmt.Sprintf("Prefs{ra=%v mesh=%v dns=%v want=%v notepad=%v derp=%v shields=%v routes=%v snat=%v nf=%v %v}",
-		p.RouteAll, p.AllowSingleHosts, p.CorpDNS, p.WantRunning,
-		p.NotepadURLs, !p.DisableDERP, p.ShieldsUp, p.AdvertiseRoutes, !p.NoSNAT, p.NetfilterMode, pp)
+	fmt.Fprintf(&sb, "dns=%v want=%v ", p.CorpDNS, p.WantRunning)
+	if p.ForceDaemon {
+		sb.WriteString("server=true ")
+	}
+	if p.NotepadURLs {
+		sb.WriteString("notepad=true ")
+	}
+	if p.ShieldsUp {
+		sb.WriteString("shields=true ")
+	}
+	if len(p.AdvertiseRoutes) > 0 || goos == "linux" {
+		fmt.Fprintf(&sb, "routes=%v ", p.AdvertiseRoutes)
+	}
+	if len(p.AdvertiseRoutes) > 0 || p.NoSNAT {
+		fmt.Fprintf(&sb, "snat=%v ", !p.NoSNAT)
+	}
+	if len(p.AdvertiseTags) > 0 {
+		fmt.Fprintf(&sb, "tags=%s ", strings.Join(p.AdvertiseTags, ","))
+	}
+	if goos == "linux" {
+		fmt.Fprintf(&sb, "nf=%v ", p.NetfilterMode)
+	}
+	if p.ControlURL != "" && p.ControlURL != "https://login.tailscale.com" {
+		fmt.Fprintf(&sb, "url=%q ", p.ControlURL)
+	}
+	if p.Persist != nil {
+		sb.WriteString(p.Persist.Pretty())
+	} else {
+		sb.WriteString("Persist=nil")
+	}
+	sb.WriteString("}")
+	return sb.String()
 }
 
 func (p *Prefs) ToBytes() []byte {
@@ -137,13 +193,13 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.CorpDNS == p2.CorpDNS &&
 		p.WantRunning == p2.WantRunning &&
 		p.NotepadURLs == p2.NotepadURLs &&
-		p.DisableDERP == p2.DisableDERP &&
 		p.ShieldsUp == p2.ShieldsUp &&
 		p.NoSNAT == p2.NoSNAT &&
 		p.NetfilterMode == p2.NetfilterMode &&
 		p.Hostname == p2.Hostname &&
 		p.OSVersion == p2.OSVersion &&
 		p.DeviceModel == p2.DeviceModel &&
+		p.ForceDaemon == p2.ForceDaemon &&
 		compareIPNets(p.AdvertiseRoutes, p2.AdvertiseRoutes) &&
 		compareStrings(p.AdvertiseTags, p2.AdvertiseTags) &&
 		p.Persist.Equals(p2.Persist)
@@ -213,26 +269,16 @@ func PrefsFromBytes(b []byte, enforceDefaults bool) (*Prefs, error) {
 	return p, err
 }
 
-// Clone returns a deep copy of p.
-func (p *Prefs) Clone() *Prefs {
-	// TODO: write a faster/non-Fatal-y Clone implementation?
-	p2, err := PrefsFromBytes(p.ToBytes(), false)
-	if err != nil {
-		log.Fatalf("Prefs was uncopyable: %v\n", err)
-	}
-	return p2
-}
-
 // LoadPrefs loads a legacy relaynode config file into Prefs
 // with sensible migration defaults set.
 func LoadPrefs(filename string) (*Prefs, error) {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("loading prefs from %q: %v", filename, err)
+		return nil, fmt.Errorf("LoadPrefs open: %w", err) // err includes path
 	}
 	p, err := PrefsFromBytes(data, false)
 	if err != nil {
-		return nil, fmt.Errorf("decoding prefs in %q: %v", filename, err)
+		return nil, fmt.Errorf("LoadPrefs(%q) decode: %w", filename, err)
 	}
 	return p, nil
 }

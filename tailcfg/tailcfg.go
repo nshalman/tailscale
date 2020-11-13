@@ -4,7 +4,7 @@
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/cloner -type=User,Node,Hostinfo,NetInfo -output=tailcfg_clone.go
+//go:generate go run tailscale.com/cmd/cloner --type=User,Node,Hostinfo,NetInfo,Group,Role,Capability,Login,DNSConfig,RegisterResponse --clonefunc=true --output=tailcfg_clone.go
 
 import (
 	"bytes"
@@ -27,13 +27,33 @@ type ID int64
 
 type UserID ID
 
+func (u UserID) IsZero() bool {
+	return u == 0
+}
+
 type LoginID ID
+
+func (u LoginID) IsZero() bool {
+	return u == 0
+}
 
 type NodeID ID
 
+func (u NodeID) IsZero() bool {
+	return u == 0
+}
+
 type GroupID ID
 
+func (u GroupID) IsZero() bool {
+	return u == 0
+}
+
 type RoleID ID
+
+func (u RoleID) IsZero() bool {
+	return u == 0
+}
 
 type CapabilityID ID
 
@@ -114,7 +134,7 @@ type UserProfile struct {
 	LoginName     string // "alice@smith.com"; for display purposes only (provider is not listed)
 	DisplayName   string // "Alice Smith"
 	ProfilePicURL string
-	Roles         []RoleID
+	Roles         []RoleID // deprecated; clients should not rely on Roles
 }
 
 type Node struct {
@@ -239,7 +259,7 @@ type Service struct {
 	_           structs.Incomparable
 	Proto       ServiceProto // TCP or UDP
 	Port        uint16       // port number service is listening on
-	Description string       // text description of service
+	Description string       `json:",omitempty"` // text description of service
 	// TODO(apenwarr): allow advertising services on subnet IPs?
 	// TODO(apenwarr): add "tags" here for each service?
 
@@ -255,13 +275,13 @@ type Hostinfo struct {
 	// TODO(crawshaw): mark all these fields ",omitempty" when all the
 	// iOS apps are updated with the latest swift version of this struct.
 	IPNVersion    string       // version of this code
-	FrontendLogID string       // logtail ID of frontend instance
-	BackendLogID  string       // logtail ID of backend instance
+	FrontendLogID string       `json:",omitempty"` // logtail ID of frontend instance
+	BackendLogID  string       `json:",omitempty"` // logtail ID of backend instance
 	OS            string       // operating system the client runs on (a version.OS value)
-	OSVersion     string       // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
-	DeviceModel   string       // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
+	OSVersion     string       `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
+	DeviceModel   string       `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
 	Hostname      string       // name of the host the client runs on
-	GoArch        string       // the host's GOARCH value (of the running binary)
+	GoArch        string       `json:",omitempty"` // the host's GOARCH value (of the running binary)
 	RoutableIPs   []wgcfg.CIDR `json:",omitempty"` // set of IP ranges this client can route
 	RequestTags   []string     `json:",omitempty"` // set of ACL tags this node wants to claim
 	Services      []Service    `json:",omitempty"` // services advertised by this machine
@@ -308,7 +328,7 @@ type NetInfo struct {
 	PreferredDERP int
 
 	// LinkType is the current link type, if known.
-	LinkType string // "wired", "wifi", "mobile" (LTE, 4G, 3G, etc)
+	LinkType string `json:",omitempty"` // "wired", "wifi", "mobile" (LTE, 4G, 3G, etc)
 
 	// DERPLatency is the fastest recent time to reach various
 	// DERP STUN servers, in seconds. The map key is the
@@ -441,22 +461,51 @@ type RegisterResponse struct {
 // using the local machine key, and sent to:
 //	https://login.tailscale.com/machine/<mkey hex>/map
 type MapRequest struct {
-	Version     int    // current version is 4
+	// Version is incremented whenever the client code changes enough that
+	// we want to signal to the control server that we're capable of something
+	// different.
+	//
+	// History of versions:
+	//     3: implicit compression, keep-alives
+	//     4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
+	//     5: 2020-10-19, implies IncludeIPv6, DeltaPeers/DeltaUserProfiles, supports MagicDNS
+	Version     int
 	Compress    string // "zstd" or "" (no compression)
 	KeepAlive   bool   // whether server should send keep-alives back to us
 	NodeKey     NodeKey
 	DiscoKey    DiscoKey
 	Endpoints   []string // caller's endpoints (IPv4 or IPv6)
-	IncludeIPv6 bool     // include IPv6 endpoints in returned Node Endpoints
-	DeltaPeers  bool     // whether the 2nd+ network map in response should be deltas, using PeersChanged, PeersRemoved
+	IncludeIPv6 bool     `json:",omitempty"` // include IPv6 endpoints in returned Node Endpoints (for Version 4 clients)
 	Stream      bool     // if true, multiple MapResponse objects are returned
 	Hostinfo    *Hostinfo
 
-	// DebugForceDisco is a temporary flag during the deployment
-	// of magicsock active discovery. It says that that the client
-	// has environment variables explicitly turning discovery on,
-	// so control should not disable it.
-	DebugForceDisco bool `json:"debugForceDisco,omitempty"`
+	// ReadOnly is whether the client just wants to fetch the
+	// MapResponse, without updating their Endpoints. The
+	// Endpoints field will be ignored and LastSeen will not be
+	// updated and peers will not be notified of changes.
+	//
+	// The intended use is for clients to discover the DERP map at
+	// start-up before their first real endpoint update.
+	ReadOnly bool `json:",omitempty"`
+
+	// OmitPeers is whether the client is okay with the Peers list
+	// being omitted in the response. (For example, a client on
+	// start up using ReadOnly to get the DERP map.)
+	OmitPeers bool `json:",omitempty"`
+
+	// DebugFlags is a list of strings specifying debugging and
+	// development features to enable in handling this map
+	// request. The values are deliberately unspecified, as they get
+	// added and removed all the time during development, and offer no
+	// compatibility promise. To roll out semantic changes, bump
+	// Version instead.
+	//
+	// Current DebugFlags values are:
+	//     * "warn-ip-forwarding-off": client is trying to be a subnet
+	//       router but their IP forwarding is broken.
+	//     * "v6-overlay": IPv6 development flag to have control send
+	//       v6 node addrs
+	DebugFlags []string `json:",omitempty"`
 }
 
 // PortRange represents a range of UDP or TCP port numbers.
@@ -470,23 +519,42 @@ var PortRangeAny = PortRange{0, 65535}
 // NetPortRange represents a single subnet:portrange.
 type NetPortRange struct {
 	_     structs.Incomparable
-	IP    string
-	Bits  *int // backward compatibility: if missing, means "all" bits
+	IP    string // "*" means all
+	Bits  *int   // backward compatibility: if missing, means "all" bits
 	Ports PortRange
 }
 
 // FilterRule represents one rule in a packet filter.
+//
+// A rule is logically a set of source CIDRs to match (described by
+// SrcIPs and SrcBits), and a set of destination targets that are then
+// allowed if a source IP is mathces of those CIDRs.
 type FilterRule struct {
-	SrcIPs   []string
-	SrcBits  []int
+	// SrcIPs are the source IPs/networks to match.
+	// The special value "*" means to match all.
+	SrcIPs []string
+
+	// SrcBits values correspond to the SrcIPs above.
+	//
+	// If present at the same index, it changes the SrcIP above to
+	// be a network with /n CIDR bits. If the slice is nil or
+	// insufficiently long, the default value (for an IPv4
+	// address) for a position is 32, as if the SrcIPs above were
+	// a /32 mask. For a "*" SrcIPs value, the corresponding
+	// SrcBits value is ignored.
+	// TODO: for IPv6, clarify default bits length.
+	SrcBits []int
+
+	// DstPorts are the port ranges to allow once a source IP
+	// matches (is in the CIDR described by SrcIPs & SrcBits).
 	DstPorts []NetPortRange
 }
 
 var FilterAllowAll = []FilterRule{
-	FilterRule{
+	{
 		SrcIPs:  []string{"*"},
 		SrcBits: nil,
-		DstPorts: []NetPortRange{NetPortRange{
+		DstPorts: []NetPortRange{{
 			IP:    "*",
 			Bits:  nil,
 			Ports: PortRange{0, 65535},
@@ -496,10 +564,18 @@ var FilterAllowAll = []FilterRule{
 
 // DNSConfig is the DNS configuration.
 type DNSConfig struct {
+	// Nameservers are the IP addresses of the nameservers to use.
 	Nameservers []netaddr.IP `json:",omitempty"`
-	Domains     []string     `json:",omitempty"`
-	PerDomain   bool
-	Proxied     bool
+	// Domains are the search domains to use.
+	Domains []string `json:",omitempty"`
+	// PerDomain indicates whether it is preferred to use Nameservers
+	// only for DNS queries for subdomains of Domains.
+	// Some OSes and OS configurations don't support per-domain DNS configuration,
+	// in which case Nameservers applies to all DNS requests regardless of PerDomain's value.
+	PerDomain bool
+	// Proxied indicates whether DNS requests are proxied through a tsdns.Resolver.
+	// This enables Magic DNS. It is togglable independently of PerDomain.
+	Proxied bool
 }
 
 type MapResponse struct {
@@ -537,8 +613,8 @@ type MapResponse struct {
 	// ACLs
 	Domain       string
 	PacketFilter []FilterRule
-	UserProfiles []UserProfile
-	Roles        []Role
+	UserProfiles []UserProfile // as of 1.1.541: may be new or updated user profiles only
+	Roles        []Role        // deprecated; clients should not rely on Roles
 	// TODO: Groups       []Group
 	// TODO: Capabilities []Capability
 
@@ -570,10 +646,19 @@ type Debug struct {
 	// highest priority (if set), then this (if set), then the
 	// binary default value.
 	DERPRoute opt.Bool `json:",omitempty"`
+
+	// TrimWGConfig controls whether Tailscale does lazy, on-demand
+	// wireguard configuration of peers.
+	TrimWGConfig opt.Bool `json:",omitempty"`
+
+	// DisableSubnetsIfPAC controls whether subnet routers should be
+	// disabled if WPAD is present on the network.
+	DisableSubnetsIfPAC opt.Bool `json:",omitempty"`
 }
 
 func (k MachineKey) String() string                   { return fmt.Sprintf("mkey:%x", k[:]) }
 func (k MachineKey) MarshalText() ([]byte, error)     { return keyMarshalText("mkey:", k), nil }
+func (k MachineKey) HexString() string                { return fmt.Sprintf("%x", k[:]) }
 func (k *MachineKey) UnmarshalText(text []byte) error { return keyUnmarshalText(k[:], "mkey:", text) }
 
 func keyMarshalText(prefix string, k [32]byte) []byte {
@@ -602,6 +687,9 @@ func (k *NodeKey) UnmarshalText(text []byte) error { return keyUnmarshalText(k[:
 
 // IsZero reports whether k is the zero value.
 func (k NodeKey) IsZero() bool { return k == NodeKey{} }
+
+// IsZero reports whether k is the zero value.
+func (k MachineKey) IsZero() bool { return k == MachineKey{} }
 
 func (k DiscoKey) String() string                   { return fmt.Sprintf("discokey:%x", k[:]) }
 func (k DiscoKey) MarshalText() ([]byte, error)     { return keyMarshalText("discokey:", k), nil }

@@ -23,6 +23,7 @@ type Config struct {
 	// if the manager does not support per-domain settings.
 	PerDomain bool
 	// Proxied indicates whether DNS requests are proxied through a tsdns.Resolver.
+	// This enables Magic DNS.
 	Proxied bool
 }
 
@@ -62,7 +63,8 @@ func (lhs Config) Equal(rhs Config) bool {
 // ManagerConfig is the set of parameters from which
 // a manager implementation is chosen and initialized.
 type ManagerConfig struct {
-	// logf is the logger for the manager to use.
+	// Logf is the logger for the manager to use.
+	// It is wrapped with a "dns: " prefix.
 	Logf logger.Logf
 	// InterfaceNAme is the name of the interface with which DNS settings should be associated.
 	InterfaceName string

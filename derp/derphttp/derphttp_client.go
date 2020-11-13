@@ -14,21 +14,27 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/derp"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
+	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -252,14 +258,41 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		}
 	}()
 
-	var httpConn net.Conn // a TCP conn or a TLS conn; what we speak HTTP to
+	var httpConn net.Conn    // a TCP conn or a TLS conn; what we speak HTTP to
+	var serverPub key.Public // or zero if unknown (if not using TLS or TLS middlebox eats it)
+	var serverProtoVersion int
 	if c.useHTTPS() {
-		httpConn = c.tlsClient(tcpConn, node)
+		tlsConn := c.tlsClient(tcpConn, node)
+		httpConn = tlsConn
+
+		// Force a handshake now (instead of waiting for it to
+		// be done implicitly on read/write) so we can check
+		// the ConnectionState.
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, 0, err
+		}
+
+		// We expect to be using TLS 1.3 to our own servers, and only
+		// starting at TLS 1.3 are the server's returned certificates
+		// encrypted, so only look for and use our "meta cert" if we're
+		// using TLS 1.3. If we're not using TLS 1.3, it might be a user
+		// running cmd/derper themselves with a different configuration,
+		// in which case we can avoid this fast-start optimization.
+		// (If a corporate proxy is MITM'ing TLS 1.3 connections with
+		// corp-mandated TLS root certs than all bets are off anyway.)
+		// Note that we're not specifically concerned about TLS downgrade
+		// attacks. TLS handles that fine:
+		// https://blog.gypsyengineer.com/en/security/how-does-tls-1-3-protect-against-downgrade-attacks.html
+		connState := tlsConn.ConnectionState()
+		if connState.Version >= tls.VersionTLS13 {
+			serverPub, serverProtoVersion = parseMetaCert(connState.PeerCertificates)
+		}
 	} else {
 		httpConn = tcpConn
 	}
 
 	brw := bufio.NewReadWriter(bufio.NewReader(httpConn), bufio.NewWriter(httpConn))
+	var derpClient *derp.Client
 
 	req, err := http.NewRequest("GET", c.urlString(node), nil)
 	if err != nil {
@@ -268,24 +301,39 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	req.Header.Set("Upgrade", "DERP")
 	req.Header.Set("Connection", "Upgrade")
 
-	if err := req.Write(brw); err != nil {
-		return nil, 0, err
-	}
-	if err := brw.Flush(); err != nil {
-		return nil, 0, err
-	}
+	if !serverPub.IsZero() && serverProtoVersion != 0 {
+		// parseMetaCert found the server's public key (no TLS
+		// middlebox was in the way), so skip the HTTP upgrade
+		// exchange.  See https://github.com/tailscale/tailscale/issues/693
+		// for an overview. We still send the HTTP request
+		// just to get routed into the server's HTTP Handler so it
+		// can Hijack the request, but we signal with a special header
+		// that we don't want to deal with its HTTP response.
+		req.Header.Set(fastStartHeader, "1") // suppresses the server's HTTP response
+		if err := req.Write(brw); err != nil {
+			return nil, 0, err
+		}
+		// No need to flush the HTTP request. the derp.Client's initial
+		// client auth frame will flush it.
+	} else {
+		if err := req.Write(brw); err != nil {
+			return nil, 0, err
+		}
+		if err := brw.Flush(); err != nil {
+			return nil, 0, err
+		}
 
-	resp, err := http.ReadResponse(brw.Reader, req)
-	if err != nil {
-		return nil, 0, err
+		resp, err := http.ReadResponse(brw.Reader, req)
+		if err != nil {
+			return nil, 0, err
+		}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			b, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
+		}
 	}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		b, _ := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
-	}
-
-	derpClient, err := derp.NewClient(c.privateKey, httpConn, brw, c.logf, derp.MeshKey(c.MeshKey))
+	derpClient, err = derp.NewClient(c.privateKey, httpConn, brw, c.logf, derp.MeshKey(c.MeshKey), derp.ServerPublicKey(serverPub))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -364,6 +412,14 @@ func (c *Client) tlsClient(nc net.Conn, node *tailcfg.DERPNode) *tls.Conn {
 			tlsdial.SetConfigExpectedCert(tlsConf, node.CertName)
 		}
 	}
+	if n := os.Getenv("SSLKEYLOGFILE"); n != "" {
+		f, err := os.OpenFile(n, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("WARNING: writing to SSLKEYLOGFILE %v", n)
+		tlsConf.KeyLogWriter = f
+	}
 	return tls.Client(nc, tlsConf)
 }
 
@@ -420,6 +476,19 @@ const dialNodeTimeout = 1500 * time.Millisecond
 // TODO(bradfitz): longer if no options remain perhaps? ...  Or longer
 // overall but have dialRegion start overlapping races?
 func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, error) {
+	// First see if we need to use an HTTP proxy.
+	proxyReq := &http.Request{
+		Method: "GET", // doesn't really matter
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   c.tlsServerName(n),
+			Path:   "/", // unused
+		},
+	}
+	if proxyURL, err := tshttpproxy.ProxyFromEnvironment(proxyReq); err == nil && proxyURL != nil {
+		return c.dialNodeUsingProxy(ctx, n, proxyURL)
+	}
+
 	type res struct {
 		c   net.Conn
 		err error
@@ -478,6 +547,77 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func firstStr(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// dialNodeUsingProxy connects to n using a CONNECT to the HTTP(s) proxy in proxyURL.
+func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, proxyURL *url.URL) (proxyConn net.Conn, err error) {
+	pu := proxyURL
+	if pu.Scheme == "https" {
+		var d tls.Dialer
+		proxyConn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(pu.Hostname(), firstStr(pu.Port(), "443")))
+	} else {
+		var d net.Dialer
+		proxyConn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(pu.Hostname(), firstStr(pu.Port(), "80")))
+	}
+	defer func() {
+		if err != nil && proxyConn != nil {
+			// In a goroutine in case it's a *tls.Conn (that can block on Close)
+			// TODO(bradfitz): track the underlying tcp.Conn and just close that instead.
+			go proxyConn.Close()
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			proxyConn.Close()
+		}
+	}()
+
+	target := net.JoinHostPort(n.HostName, "443")
+
+	var authHeader string
+	if v, err := tshttpproxy.GetAuthHeader(pu); err != nil {
+		c.logf("derphttp: error getting proxy auth header for %v: %v", proxyURL, err)
+	} else if v != "" {
+		authHeader = fmt.Sprintf("Proxy-Authorization: %s\r\n", v)
+	}
+
+	if _, err := fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", target, pu.Hostname(), authHeader); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+
+	br := bufio.NewReader(proxyConn)
+	res, err := http.ReadResponse(br, nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		c.logf("derphttp: CONNECT dial to %s: %v", target, err)
+		return nil, err
+	}
+	c.logf("derphttp: CONNECT dial to %s: %v", target, res.Status)
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("invalid response status from HTTP proxy %s on CONNECT to %s: %v", pu, target, res.Status)
+	}
+	return proxyConn, nil
 }
 
 func (c *Client) Send(dstKey key.Public, b []byte) error {
@@ -614,3 +754,16 @@ func (c *Client) closeForReconnect(brokenClient *derp.Client) {
 }
 
 var ErrClientClosed = errors.New("derphttp.Client closed")
+
+func parseMetaCert(certs []*x509.Certificate) (serverPub key.Public, serverProtoVersion int) {
+	for _, cert := range certs {
+		if cn := cert.Subject.CommonName; strings.HasPrefix(cn, "derpkey") {
+			var err error
+			serverPub, err = key.NewPublicFromHexMem(mem.S(strings.TrimPrefix(cn, "derpkey")))
+			if err == nil && cert.SerialNumber.BitLen() <= 8 { // supports up to version 255
+				return serverPub, int(cert.SerialNumber.Int64())
+			}
+		}
+	}
+	return key.Public{}, 0
+}

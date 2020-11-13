@@ -33,6 +33,7 @@ var (
 	flagTypes     = flag.String("type", "", "comma-separated list of types; required")
 	flagOutput    = flag.String("output", "", "output file; required")
 	flagBuildTags = flag.String("tags", "", "compiler build tags to apply")
+	flagCloneFunc = flag.Bool("clonefunc", false, "add a top-level Clone func")
 )
 
 func main() {
@@ -86,13 +87,38 @@ func main() {
 					}
 					pkg := typeNameObj.Pkg()
 					gen(buf, imports, typeName, typ, pkg)
+					found = true
 				}
-				found = true
 			}
 		}
 		if !found {
 			log.Fatalf("could not find type %s", typeName)
 		}
+	}
+
+	w := func(format string, args ...interface{}) {
+		fmt.Fprintf(buf, format+"\n", args...)
+	}
+	if *flagCloneFunc {
+		w("// Clone duplicates src into dst and reports whether it succeeded.")
+		w("// To succeed, <src, dst> must be of types <*T, *T> or <*T, **T>,")
+		w("// where T is one of %s.", *flagTypes)
+		w("func Clone(dst, src interface{}) bool {")
+		w("	switch src := src.(type) {")
+		for _, typeName := range typeNames {
+			w("	case *%s:", typeName)
+			w("		switch dst := dst.(type) {")
+			w("		case *%s:", typeName)
+			w("			*dst = *src.Clone()")
+			w("			return true")
+			w("		case **%s:", typeName)
+			w("			*dst = src.Clone()")
+			w("			return true")
+			w("		}")
+		}
+		w("	}")
+		w("	return false")
+		w("}")
 	}
 
 	contents := new(bytes.Buffer)
@@ -143,7 +169,19 @@ func gen(buf *bytes.Buffer, imports map[string]struct{}, name string, typ *types
 
 	switch t := typ.Underlying().(type) {
 	case *types.Struct:
-		_ = t
+		// We generate two bits of code simultaneously while we walk the struct.
+		// One is the Clone method itself, which we write directly to buf.
+		// The other is a variable assignment that will fail if the struct
+		// changes without the Clone method getting regenerated.
+		// We write that to regenBuf, and then append it to buf at the end.
+		regenBuf := new(bytes.Buffer)
+		writeRegen := func(format string, args ...interface{}) {
+			fmt.Fprintf(regenBuf, format+"\n", args...)
+		}
+		writeRegen("// A compilation failure here means this code must be regenerated, with command:")
+		writeRegen("//   tailscale.com/cmd/cloner -type %s", *flagTypes)
+		writeRegen("var _%sNeedsRegeneration = %s(struct {", name, name)
+
 		name := typ.Obj().Name()
 		fmt.Fprintf(buf, "// Clone makes a deep copy of %s.\n", name)
 		fmt.Fprintf(buf, "// The result aliases no memory with the original.\n")
@@ -159,6 +197,9 @@ func gen(buf *bytes.Buffer, imports map[string]struct{}, name string, typ *types
 		for i := 0; i < t.NumFields(); i++ {
 			fname := t.Field(i).Name()
 			ft := t.Field(i).Type()
+
+			writeRegen("\t%s %s", fname, importedName(ft))
+
 			if !containsPointers(ft) {
 				continue
 			}
@@ -220,6 +261,10 @@ func gen(buf *bytes.Buffer, imports map[string]struct{}, name string, typ *types
 		}
 		writef("return dst")
 		fmt.Fprintf(buf, "}\n\n")
+
+		writeRegen("}{})\n")
+
+		buf.Write(regenBuf.Bytes())
 	}
 }
 

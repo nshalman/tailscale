@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package wgengine
+// +build !windows
 
-func rusageMaxRSS() float64 {
-	// TODO(apenwarr): Substitute Windows equivalent of Getrusage() here.
-	return 0
+package netstat
+
+func get() (*Table, error) {
+	return nil, ErrNotImplemented
 }

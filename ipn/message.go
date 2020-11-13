@@ -5,6 +5,7 @@
 package ipn
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,8 @@ import (
 	"tailscale.com/types/structs"
 	"tailscale.com/version"
 )
+
+var jsonEscapedZero = []byte(`\u0000`)
 
 type NoArgs struct{}
 
@@ -57,6 +60,7 @@ type Command struct {
 	Login                 *oauth2.Token
 	Logout                *NoArgs
 	SetPrefs              *SetPrefsArgs
+	SetWantRunning        *bool
 	RequestEngineStatus   *NoArgs
 	RequestStatus         *NoArgs
 	FakeExpireAfter       *FakeExpireAfterArgs
@@ -79,16 +83,30 @@ func NewBackendServer(logf logger.Logf, b Backend, sendNotifyMsg func(b []byte))
 }
 
 func (bs *BackendServer) send(n Notify) {
-	n.Version = version.LONG
+	n.Version = version.Long
 	b, err := json.Marshal(n)
 	if err != nil {
 		log.Fatalf("Failed json.Marshal(notify): %v\n%#v", err, n)
+	}
+	if bytes.Contains(b, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in BackendServer.send notify message: %q", b)
 	}
 	bs.sendNotifyMsg(b)
 }
 
 func (bs *BackendServer) SendErrorMessage(msg string) {
 	bs.send(Notify{ErrMessage: &msg})
+}
+
+// SendInUseOtherUserErrorMessage sends a Notify message to the client that
+// both sets the state to 'InUseOtherUser' and sets the associated reason
+// to msg.
+func (bs *BackendServer) SendInUseOtherUserErrorMessage(msg string) {
+	inUse := InUseOtherUser
+	bs.send(Notify{
+		State:      &inUse,
+		ErrMessage: &msg,
+	})
 }
 
 // GotCommandMsg parses the incoming message b as a JSON Command and
@@ -105,14 +123,14 @@ func (bs *BackendServer) GotCommandMsg(b []byte) error {
 }
 
 func (bs *BackendServer) GotFakeCommand(cmd *Command) error {
-	cmd.Version = version.LONG
+	cmd.Version = version.Long
 	return bs.GotCommand(cmd)
 }
 
 func (bs *BackendServer) GotCommand(cmd *Command) error {
-	if cmd.Version != version.LONG && !cmd.AllowVersionSkew {
+	if cmd.Version != version.Long && !cmd.AllowVersionSkew {
 		vs := fmt.Sprintf("GotCommand: Version mismatch! frontend=%#v backend=%#v",
-			cmd.Version, version.LONG)
+			cmd.Version, version.Long)
 		bs.logf("%s", vs)
 		// ignore the command, but send a message back to the
 		// caller so it can realize the version mismatch too.
@@ -143,6 +161,9 @@ func (bs *BackendServer) GotCommand(cmd *Command) error {
 		return nil
 	} else if c := cmd.SetPrefs; c != nil {
 		bs.b.SetPrefs(c.New)
+		return nil
+	} else if c := cmd.SetWantRunning; c != nil {
+		bs.b.SetWantRunning(*c)
 		return nil
 	} else if c := cmd.RequestEngineStatus; c != nil {
 		bs.b.RequestEngineStatus()
@@ -189,13 +210,16 @@ func (bc *BackendClient) GotNotifyMsg(b []byte) {
 		// not interesting
 		return
 	}
+	if bytes.Contains(b, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in BackendClient.GotNotifyMsg message: %q", b)
+	}
 	n := Notify{}
 	if err := json.Unmarshal(b, &n); err != nil {
 		log.Fatalf("BackendClient.Notify: cannot decode message (length=%d)\n%#v", len(b), string(b))
 	}
-	if n.Version != version.LONG && !bc.AllowVersionSkew {
+	if n.Version != version.Long && !bc.AllowVersionSkew {
 		vs := fmt.Sprintf("GotNotify: Version mismatch! frontend=%#v backend=%#v",
-			version.LONG, n.Version)
+			version.Long, n.Version)
 		bc.logf("%s", vs)
 		// delete anything in the notification except the version,
 		// to prevent incorrect operation.
@@ -210,10 +234,13 @@ func (bc *BackendClient) GotNotifyMsg(b []byte) {
 }
 
 func (bc *BackendClient) send(cmd Command) {
-	cmd.Version = version.LONG
+	cmd.Version = version.Long
 	b, err := json.Marshal(cmd)
 	if err != nil {
 		log.Fatalf("Failed json.Marshal(cmd): %v\n%#v\n", err, cmd)
+	}
+	if bytes.Contains(b, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in BackendClient.send command: %q", b)
 	}
 	bc.sendCommandMsg(b)
 }
@@ -264,6 +291,10 @@ func (bc *BackendClient) FakeExpireAfter(x time.Duration) {
 
 func (bc *BackendClient) Ping(ip string) {
 	bc.send(Command{Ping: &PingArgs{IP: ip}})
+}
+
+func (bc *BackendClient) SetWantRunning(v bool) {
+	bc.send(Command{SetWantRunning: &v})
 }
 
 // MaxMessageSize is the maximum message size, in bytes.

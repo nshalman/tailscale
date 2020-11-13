@@ -7,69 +7,96 @@ package version
 import (
 	"fmt"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
-func xcode(short, long string) string {
-	return fmt.Sprintf("VERSION_NAME = %s\nVERSION_ID = %s", short, long)
-}
-
-func mkversion(t *testing.T, mode, in string) (string, bool) {
+func mkversion(t *testing.T, gitHash, otherHash string, major, minor, patch, changeCount int) (string, bool) {
 	t.Helper()
-	bs, err := exec.Command("./mkversion.sh", mode, in).CombinedOutput()
+	bs, err := exec.Command("./version.sh", gitHash, otherHash, strconv.Itoa(major), strconv.Itoa(minor), strconv.Itoa(patch), strconv.Itoa(changeCount)).CombinedOutput()
+	out := strings.TrimSpace(string(bs))
 	if err != nil {
-		t.Logf("mkversion.sh output: %s", string(bs))
-		return "", false
+		return out, false
 	}
-	return strings.TrimSpace(string(bs)), true
+	return out, true
 }
 
 func TestMkversion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip test on Windows, because there is no shell to execute mkversion.sh.")
+	}
 	tests := []struct {
-		in    string
-		ok    bool
-		long  string
-		short string
-		xcode string
+		gitHash, otherHash               string
+		major, minor, patch, changeCount int
+		want                             string
 	}{
-		{"v0.98-abcdef", true, "0.98.0-abcdef", "0.98.0", xcode("0.98.0", "100.98.0")},
-		{"v0.98.1-abcdef", true, "0.98.1-abcdef", "0.98.1", xcode("0.98.1", "100.98.1")},
-		{"v1.1.0-37-abcdef", true, "1.1.37-abcdef", "1.1.37", xcode("1.1.37", "101.1.37")},
-		{"v1.2.9-abcdef", true, "1.2.9-abcdef", "1.2.9", xcode("1.2.9", "101.2.9")},
-		{"v1.2.9-0-abcdef", true, "1.2.9-abcdef", "1.2.9", xcode("1.2.9", "101.2.9")},
-		{"v1.15.0-129-abcdef", true, "1.15.129-abcdef", "1.15.129", xcode("1.15.129", "101.15.129")},
-
-		{"v0.98-123-abcdef", true, "0.0.0-abcdef", "0.0.0", xcode("0.0.0", "100.0.0")},
-		{"v1.0.0-37-abcdef", true, "0.0.0-abcdef", "0.0.0", xcode("0.0.0", "100.0.0")},
-
-		{"v0.99.5-0-abcdef", false, "", "", ""},   // unstable, patch not allowed
-		{"v0.99.5-123-abcdef", false, "", "", ""}, // unstable, patch not allowed
-		{"v1-abcdef", false, "", "", ""},          // bad semver
-		{"v1.0", false, "", "", ""},               // missing suffix
+		{"abcdef", "", 0, 98, 0, 0, `
+           VERSION_SHORT="0.98.0"
+           VERSION_LONG="0.98.0-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="100.98.0"
+           VERSION_WINRES="0,98,0,0"`},
+		{"abcdef", "", 0, 98, 1, 0, `
+           VERSION_SHORT="0.98.1"
+           VERSION_LONG="0.98.1-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="100.98.1"
+           VERSION_WINRES="0,98,1,0"`},
+		{"abcdef", "", 1, 1, 0, 37, `
+           VERSION_SHORT="1.1.1037"
+           VERSION_LONG="1.1.1037-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="101.1.1037"
+           VERSION_WINRES="1,1,1037,0"`},
+		{"abcdef", "", 1, 2, 9, 0, `
+           VERSION_SHORT="1.2.9"
+           VERSION_LONG="1.2.9-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="101.2.9"
+           VERSION_WINRES="1,2,9,0"`},
+		{"abcdef", "", 1, 15, 0, 129, `
+           VERSION_SHORT="1.15.129"
+           VERSION_LONG="1.15.129-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="101.15.129"
+           VERSION_WINRES="1,15,129,0"`},
+		{"abcdef", "", 1, 2, 0, 17, `
+           VERSION_SHORT="1.2.0"
+           VERSION_LONG="1.2.0-17-tabcdef"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH=""
+           VERSION_XCODE="101.2.0"
+           VERSION_WINRES="1,2,0,0"`},
+		{"abcdef", "defghi", 1, 15, 0, 129, `
+           VERSION_SHORT="1.15.129"
+           VERSION_LONG="1.15.129-tabcdef-gdefghi"
+           VERSION_GIT_HASH="abcdef"
+           VERSION_EXTRA_HASH="defghi"
+           VERSION_XCODE="101.15.129"
+           VERSION_WINRES="1,15,129,0"`},
+		{"abcdef", "", 0, 99, 5, 0, ""},   // unstable, patch number not allowed
+		{"abcdef", "", 0, 99, 5, 123, ""}, // unstable, patch number not allowed
 	}
 
 	for _, test := range tests {
-		gotlong, longOK := mkversion(t, "long", test.in)
-		if longOK != test.ok {
-			t.Errorf("mkversion.sh long %q ok=%v, want %v", test.in, longOK, test.ok)
+		want := strings.ReplaceAll(strings.TrimSpace(test.want), " ", "")
+		got, ok := mkversion(t, test.gitHash, test.otherHash, test.major, test.minor, test.patch, test.changeCount)
+		invoc := fmt.Sprintf("version.sh %s %s %d %d %d %d", test.gitHash, test.otherHash, test.major, test.minor, test.patch, test.changeCount)
+		if want == "" && ok {
+			t.Errorf("%s ok=true, want false", invoc)
+			continue
 		}
-		gotshort, shortOK := mkversion(t, "short", test.in)
-		if shortOK != test.ok {
-			t.Errorf("mkversion.sh short %q ok=%v, want %v", test.in, shortOK, test.ok)
-		}
-		gotxcode, xcodeOK := mkversion(t, "xcode", test.in)
-		if xcodeOK != test.ok {
-			t.Errorf("mkversion.sh xcode %q ok=%v, want %v", test.in, xcodeOK, test.ok)
-		}
-		if longOK && gotlong != test.long {
-			t.Errorf("mkversion.sh long %q: got %q, want %q", test.in, gotlong, test.long)
-		}
-		if shortOK && gotshort != test.short {
-			t.Errorf("mkversion.sh short %q: got %q, want %q", test.in, gotshort, test.short)
-		}
-		if xcodeOK && gotxcode != test.xcode {
-			t.Errorf("mkversion.sh xcode %q: got %q, want %q", test.in, gotxcode, test.xcode)
+		if diff := cmp.Diff(got, want); want != "" && diff != "" {
+			t.Errorf("%s wrong output (-got+want):\n%s", invoc, diff)
 		}
 	}
 }

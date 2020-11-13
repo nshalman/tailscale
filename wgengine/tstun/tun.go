@@ -63,8 +63,9 @@ type TUN struct {
 	// tdev is the underlying TUN device.
 	tdev tun.Device
 
-	_                  [4]byte // force 64-bit alignment of following field on 32-bit
-	lastActivityAtomic int64   // unix seconds of last send or receive
+	closeOnce sync.Once
+
+	lastActivityAtomic int64 // unix seconds of last send or receive
 
 	destIPActivity atomic.Value // of map[packet.IP]func()
 
@@ -140,15 +141,14 @@ func (t *TUN) SetDestIPActivityFuncs(m map[packet.IP]func()) {
 }
 
 func (t *TUN) Close() error {
-	select {
-	case <-t.closed:
-		// continue
-	default:
+	var err error
+	t.closeOnce.Do(func() {
 		// Other channels need not be closed: poll will exit gracefully after this.
 		close(t.closed)
-	}
 
-	return t.tdev.Close()
+		err = t.tdev.Close()
+	})
+	return err
 }
 
 func (t *TUN) Events() chan tun.Event {
@@ -376,7 +376,7 @@ func (t *TUN) InjectInboundDirect(buf []byte, offset int) error {
 }
 
 // InjectInboundCopy takes a packet without leading space,
-// reallocates it to conform to the InjectInbondDirect interface
+// reallocates it to conform to the InjectInboundDirect interface
 // and calls InjectInboundDirect on it. Injecting a nil packet is a no-op.
 func (t *TUN) InjectInboundCopy(packet []byte) error {
 	// We duplicate this check from InjectInboundDirect here

@@ -31,6 +31,7 @@ import (
 	"tailscale.com/logtail/filch"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
+	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
@@ -314,6 +315,9 @@ func New(collection string) *Policy {
 	} else {
 		lflags = log.LstdFlags
 	}
+	if v, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_LOG_TIME")); v {
+		lflags = log.LstdFlags | log.Lmicroseconds
+	}
 	if runningUnderSystemd() {
 		// If journalctl is going to prepend its own timestamp
 		// anyway, no need to add one.
@@ -355,7 +359,7 @@ func New(collection string) *Policy {
 		newc.PrivateID = logtail.PrivateID{}
 		newc.Collection = collection
 	}
-	if newc.PrivateID == (logtail.PrivateID{}) {
+	if newc.PrivateID.IsZero() {
 		newc.PrivateID, err = logtail.NewPrivateID()
 		if err != nil {
 			log.Fatalf("logpolicy: NewPrivateID() should never fail")
@@ -391,7 +395,7 @@ func New(collection string) *Policy {
 	log.SetOutput(lw)
 
 	log.Printf("Program starting: v%v, Go %v: %#v",
-		version.LONG,
+		version.Long,
 		strings.TrimPrefix(runtime.Version(), "go"),
 		os.Args)
 	log.Printf("LogID: %v", newc.PublicID)
@@ -430,6 +434,9 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 func newLogtailTransport(host string) *http.Transport {
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+
+	tr.Proxy = tshttpproxy.ProxyFromEnvironment
+	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
 
 	// We do our own zstd compression on uploads, and responses never contain any payload,
 	// so don't send "Accept-Encoding: gzip" to save a few bytes on the wire, since there

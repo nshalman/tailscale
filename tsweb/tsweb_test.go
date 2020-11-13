@@ -122,7 +122,7 @@ func TestStdHandler(t *testing.T) {
 				Host:       "example.com",
 				Method:     "GET",
 				RequestURI: "/foo",
-				Err:        testErr.Error(),
+				Err:        "not found: " + testErr.Error(),
 				Code:       404,
 			},
 		},
@@ -139,6 +139,7 @@ func TestStdHandler(t *testing.T) {
 				Host:       "example.com",
 				Method:     "GET",
 				RequestURI: "/foo",
+				Err:        "not found",
 				Code:       404,
 			},
 		},
@@ -189,7 +190,7 @@ func TestStdHandler(t *testing.T) {
 				Host:       "example.com",
 				Method:     "GET",
 				RequestURI: "/foo",
-				Err:        testErr.Error(),
+				Err:        "not found: " + testErr.Error(),
 				Code:       200,
 			},
 		},
@@ -247,7 +248,7 @@ func TestStdHandler(t *testing.T) {
 			clock.Reset()
 
 			rec := noopHijacker{httptest.NewRecorder(), false}
-			h := stdHandler(test.rh, logf, clock.Now, true)
+			h := StdHandlerOpts(test.rh, HandlerOptions{Logf: logf, Now: clock.Now})
 			h.ServeHTTP(&rec, test.r)
 			res := rec.Result()
 			if res.StatusCode != test.wantCode {

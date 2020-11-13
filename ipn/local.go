@@ -5,9 +5,12 @@
 package ipn
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +22,7 @@ import (
 	"tailscale.com/internal/deepprint"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/policy"
+	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/portlist"
 	"tailscale.com/tailcfg"
@@ -32,6 +36,15 @@ import (
 	"tailscale.com/wgengine/router/dns"
 	"tailscale.com/wgengine/tsdns"
 )
+
+var controlDebugFlags = getControlDebugFlags()
+
+func getControlDebugFlags() []string {
+	if e := os.Getenv("TS_DEBUG_CONTROL_FLAGS"); e != "" {
+		return strings.Split(e, ",")
+	}
+	return nil
+}
 
 // LocalBackend is the glue between the major pieces of the Tailscale
 // network software: the cloud control plane (via controlclient), the
@@ -49,32 +62,39 @@ type LocalBackend struct {
 	ctxCancel       context.CancelFunc // cancels ctx
 	logf            logger.Logf        // general logging
 	keyLogf         logger.Logf        // for printing list of peers on change
+	statsLogf       logger.Logf        // for printing peers stats on change
 	e               wgengine.Engine
 	store           StateStore
 	backendLogID    string
 	portpoll        *portlist.Poller // may be nil
-	portpollOnce    sync.Once
-	serverURL       string // tailcontrol URL
+	portpollOnce    sync.Once        // guards starting readPoller
+	gotPortPollRes  chan struct{}    // closed upon first readPoller result
+	serverURL       string           // tailcontrol URL
 	newDecompressor func() (controlclient.Decompressor, error)
 
 	filterHash string
 
 	// The mutex protects the following elements.
-	mu       sync.Mutex
-	notify   func(Notify)
-	c        *controlclient.Client
-	stateKey StateKey
-	prefs    *Prefs
-	state    State
+	mu             sync.Mutex
+	notify         func(Notify)
+	c              *controlclient.Client
+	stateKey       StateKey // computed in part from user-provided value
+	userID         string   // current controlling user ID (for Windows, primarily)
+	prefs          *Prefs
+	inServerMode   bool
+	machinePrivKey wgcfg.PrivateKey
+	state          State
 	// hostinfo is mutated in-place while mu is held.
 	hostinfo *tailcfg.Hostinfo
 	// netMap is not mutated in-place once set.
 	netMap       *controlclient.NetworkMap
+	activeLogin  string // last logged LoginName from netMap
 	engineStatus EngineStatus
 	endpoints    []string
 	blocked      bool
 	authURL      string
-	interact     int
+	interact     bool
+	prevIfState  *interfaces.State
 
 	// statusLock must be held before calling statusChanged.Wait() or
 	// statusChanged.Broadcast().
@@ -99,19 +119,49 @@ func NewLocalBackend(logf logger.Logf, logid string, store StateStore, e wgengin
 	}
 
 	b := &LocalBackend{
-		ctx:          ctx,
-		ctxCancel:    cancel,
-		logf:         logf,
-		keyLogf:      logger.LogOnChange(logf, 5*time.Minute, time.Now),
-		e:            e,
-		store:        store,
-		backendLogID: logid,
-		state:        NoState,
-		portpoll:     portpoll,
+		ctx:            ctx,
+		ctxCancel:      cancel,
+		logf:           logf,
+		keyLogf:        logger.LogOnChange(logf, 5*time.Minute, time.Now),
+		statsLogf:      logger.LogOnChange(logf, 5*time.Minute, time.Now),
+		e:              e,
+		store:          store,
+		backendLogID:   logid,
+		state:          NoState,
+		portpoll:       portpoll,
+		gotPortPollRes: make(chan struct{}),
 	}
+	e.SetLinkChangeCallback(b.linkChange)
 	b.statusChanged = sync.NewCond(&b.statusLock)
 
 	return b, nil
+}
+
+// linkChange is called (in a new goroutine) by wgengine when its link monitor
+// detects a network change.
+func (b *LocalBackend) linkChange(major bool, ifst *interfaces.State) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	hadPAC := b.prevIfState.HasPAC()
+	b.prevIfState = ifst
+
+	networkUp := ifst.AnyInterfaceUp()
+	if b.c != nil {
+		go b.c.SetPaused(b.state == Stopped || !networkUp)
+	}
+
+	// If the PAC-ness of the network changed, reconfig wireguard+route to
+	// add/remove subnets.
+	if hadPAC != ifst.HasPAC() {
+		b.logf("linkChange: in state %v; PAC changed from %v->%v", b.state, hadPAC, ifst.HasPAC())
+		switch b.state {
+		case NoState, Stopped:
+			// Do nothing.
+		default:
+			go b.authReconfig()
+		}
+	}
 }
 
 // Shutdown halts the backend and all its sub-components. The backend
@@ -144,6 +194,8 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	sb.SetBackendState(b.state.String())
+
 	// TODO: hostinfo, and its networkinfo
 	// TODO: EngineStatus copy (and deprecate it?)
 	if b.netMap != nil {
@@ -164,6 +216,7 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 				UserID:       p.User,
 				TailAddr:     tailAddr,
 				HostName:     p.Hostinfo.Hostname,
+				DNSName:      p.Name,
 				OS:           p.Hostinfo.OS,
 				KeepAlive:    p.KeepAlive,
 				Created:      p.Created,
@@ -216,8 +269,14 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 			b.prefs.Persist = st.Persist.Clone()
 		}
 	}
+	if temporarilySetMachineKeyInPersist() && b.prefs.Persist != nil &&
+		b.prefs.Persist.LegacyFrontendPrivateMachineKey.IsZero() {
+		b.prefs.Persist.LegacyFrontendPrivateMachineKey = b.machinePrivKey
+		prefsChanged = true
+	}
 	if st.NetMap != nil {
-		b.netMap = st.NetMap
+		b.setNetMapLocked(st.NetMap)
+
 	}
 	if st.URL != "" {
 		b.authURL = st.URL
@@ -256,23 +315,16 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 
 		b.updateFilter(st.NetMap, prefs)
 		b.e.SetNetworkMap(st.NetMap)
-
 		if !dnsMapsEqual(st.NetMap, netMap) {
 			b.updateDNSMap(st.NetMap)
 		}
-
-		disableDERP := prefs != nil && prefs.DisableDERP
-		if disableDERP {
-			b.e.SetDERPMap(nil)
-		} else {
-			b.e.SetDERPMap(st.NetMap.DERPMap)
-		}
+		b.e.SetDERPMap(st.NetMap.DERPMap)
 
 		b.send(Notify{NetMap: st.NetMap})
 	}
 	if st.URL != "" {
 		b.logf("Received auth URL: %.20v...", st.URL)
-		if interact > 0 {
+		if interact {
 			b.popBrowserAuthNow()
 		}
 	}
@@ -294,9 +346,8 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 		return
 	}
 
-	es := b.parseWgStatus(s)
-
 	b.mu.Lock()
+	es := b.parseWgStatusLocked(s)
 	c := b.c
 	b.engineStatus = es
 	b.endpoints = append([]string{}, s.LocalAddrs...)
@@ -364,17 +415,43 @@ func (b *LocalBackend) Start(opts Options) error {
 		return fmt.Errorf("loading requested state: %v", err)
 	}
 
+	b.inServerMode = b.prefs.ForceDaemon
 	b.serverURL = b.prefs.ControlURL
 	hostinfo.RoutableIPs = append(hostinfo.RoutableIPs, b.prefs.AdvertiseRoutes...)
 	hostinfo.RequestTags = append(hostinfo.RequestTags, b.prefs.AdvertiseTags...)
+	if b.inServerMode || runtime.GOOS == "windows" {
+		b.logf("Start: serverMode=%v", b.inServerMode)
+	}
 	applyPrefsToHostinfo(hostinfo, b.prefs)
 
 	b.notify = opts.Notify
-	b.netMap = nil
+	b.setNetMapLocked(nil)
 	persist := b.prefs.Persist
+	machinePrivKey := b.machinePrivKey
 	b.mu.Unlock()
 
 	b.updateFilter(nil, nil)
+
+	if b.portpoll != nil {
+		b.portpollOnce.Do(func() {
+			go b.portpoll.Run(b.ctx)
+			go b.readPoller()
+
+			// Give the poller a second to get results to
+			// prevent it from restarting our map poll
+			// HTTP request (via doSetHostinfoFilterServices >
+			// cli.SetHostinfo). In practice this is very quick.
+			t0 := time.Now()
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-b.gotPortPollRes:
+				b.logf("got initial portlist info in %v", time.Since(t0).Round(time.Millisecond))
+				timer.Stop()
+			case <-timer.C:
+				b.logf("timeout waiting for initial portlist")
+			}
+		})
+	}
 
 	var discoPublic tailcfg.DiscoKey
 	if controlclient.Debug.Disco {
@@ -387,27 +464,20 @@ func (b *LocalBackend) Start(opts Options) error {
 		persist = &controlclient.Persist{}
 	}
 	cli, err := controlclient.New(controlclient.Options{
-		Logf:            logger.WithPrefix(b.logf, "control: "),
-		Persist:         *persist,
-		ServerURL:       b.serverURL,
-		AuthKey:         opts.AuthKey,
-		Hostinfo:        hostinfo,
-		KeepAlive:       true,
-		NewDecompressor: b.newDecompressor,
-		HTTPTestClient:  opts.HTTPTestClient,
-		DiscoPublicKey:  discoPublic,
+		MachinePrivateKey: machinePrivKey,
+		Logf:              logger.WithPrefix(b.logf, "control: "),
+		Persist:           *persist,
+		ServerURL:         b.serverURL,
+		AuthKey:           opts.AuthKey,
+		Hostinfo:          hostinfo,
+		KeepAlive:         true,
+		NewDecompressor:   b.newDecompressor,
+		HTTPTestClient:    opts.HTTPTestClient,
+		DiscoPublicKey:    discoPublic,
+		DebugFlags:        controlDebugFlags,
 	})
 	if err != nil {
 		return err
-	}
-
-	// At this point, we have finished using hostinfo without synchronization,
-	// so it is safe to start readPoller which concurrently writes to it.
-	if b.portpoll != nil {
-		b.portpollOnce.Do(func() {
-			go b.portpoll.Run(b.ctx)
-			go b.readPoller()
-		})
 	}
 
 	b.mu.Lock()
@@ -425,6 +495,12 @@ func (b *LocalBackend) Start(opts Options) error {
 
 	b.mu.Lock()
 	prefs := b.prefs.Clone()
+
+	if temporarilySetMachineKeyInPersist() && prefs.Persist != nil &&
+		prefs.Persist.LegacyFrontendPrivateMachineKey.IsZero() {
+		prefs.Persist.LegacyFrontendPrivateMachineKey = b.machinePrivKey
+	}
+
 	b.mu.Unlock()
 
 	blid := b.backendLogID
@@ -539,7 +615,7 @@ func (b *LocalBackend) updateDNSMap(netMap *controlclient.NetworkMap) {
 
 	nameToIP := make(map[string]netaddr.IP)
 	set := func(name string, addrs []wgcfg.CIDR) {
-		if len(addrs) == 0 {
+		if len(addrs) == 0 || name == "" {
 			return
 		}
 		nameToIP[name] = netaddr.IPFrom16(addrs[0].IP.Addr)
@@ -550,7 +626,7 @@ func (b *LocalBackend) updateDNSMap(netMap *controlclient.NetworkMap) {
 	}
 	set(netMap.Name, netMap.Addresses)
 
-	dnsMap := tsdns.NewMap(nameToIP)
+	dnsMap := tsdns.NewMap(nameToIP, domainsForProxying(netMap))
 	// map diff will be logged in tsdns.Resolver.SetMap.
 	b.e.SetDNSMap(dnsMap)
 }
@@ -558,6 +634,7 @@ func (b *LocalBackend) updateDNSMap(netMap *controlclient.NetworkMap) {
 // readPoller is a goroutine that receives service lists from
 // b.portpoll and propagates them into the controlclient's HostInfo.
 func (b *LocalBackend) readPoller() {
+	n := 0
 	for {
 		ports, ok := <-b.portpoll.C
 		if !ok {
@@ -584,6 +661,11 @@ func (b *LocalBackend) readPoller() {
 		b.mu.Unlock()
 
 		b.doSetHostinfoFilterServices(hi)
+
+		n++
+		if n == 1 {
+			close(b.gotPortPollRes)
+		}
 	}
 }
 
@@ -595,7 +677,7 @@ func (b *LocalBackend) send(n Notify) {
 	b.mu.Unlock()
 
 	if notify != nil {
-		n.Version = version.LONG
+		n.Version = version.Long
 		notify(n)
 	} else {
 		b.logf("nil notify callback; dropping %+v", n)
@@ -607,7 +689,7 @@ func (b *LocalBackend) send(n Notify) {
 func (b *LocalBackend) popBrowserAuthNow() {
 	b.mu.Lock()
 	url := b.authURL
-	b.interact = 0
+	b.interact = false
 	b.authURL = ""
 	b.mu.Unlock()
 
@@ -621,48 +703,171 @@ func (b *LocalBackend) popBrowserAuthNow() {
 	}
 }
 
+// initMachineKeyLocked is called to initialize b.machinePrivKey.
+//
+// b.prefs must already be initialized.
+// b.stateKey should be set too, but just for nicer log messages.
+// b.mu must be held.
+func (b *LocalBackend) initMachineKeyLocked() (err error) {
+	if temporarilySetMachineKeyInPersist() {
+		defer func() {
+			if err != nil {
+				return
+			}
+			if b.prefs != nil && b.prefs.Persist != nil {
+				b.prefs.Persist.LegacyFrontendPrivateMachineKey = b.machinePrivKey
+			}
+		}()
+	}
+
+	if !b.machinePrivKey.IsZero() {
+		// Already set.
+		return nil
+	}
+
+	var legacyMachineKey wgcfg.PrivateKey
+	if b.prefs.Persist != nil {
+		legacyMachineKey = b.prefs.Persist.LegacyFrontendPrivateMachineKey
+	}
+
+	keyText, err := b.store.ReadState(MachineKeyStateKey)
+	if err == nil {
+		if err := b.machinePrivKey.UnmarshalText(keyText); err != nil {
+			return fmt.Errorf("invalid key in %s key of %v: %w", MachineKeyStateKey, b.store, err)
+		}
+		if b.machinePrivKey.IsZero() {
+			return fmt.Errorf("invalid zero key stored in %v key of %v", MachineKeyStateKey, b.store)
+		}
+		if !legacyMachineKey.IsZero() && !bytes.Equal(legacyMachineKey[:], b.machinePrivKey[:]) {
+			b.logf("frontend-provided legacy machine key ignored; used value from server state")
+		}
+		return nil
+	}
+	if err != ErrStateNotExist {
+		return fmt.Errorf("error reading %v key of %v: %w", MachineKeyStateKey, b.store, err)
+	}
+
+	// If we didn't find one already on disk and the prefs already
+	// have a legacy machine key, use that. Otherwise generate a
+	// new one.
+	if !legacyMachineKey.IsZero() {
+		if b.stateKey == "" {
+			b.logf("using frontend-provided legacy machine key")
+		} else {
+			b.logf("using legacy machine key from state key %q", b.stateKey)
+		}
+		b.machinePrivKey = legacyMachineKey
+	} else {
+		b.logf("generating new machine key")
+		var err error
+		b.machinePrivKey, err = wgcfg.NewPrivateKey()
+		if err != nil {
+			return fmt.Errorf("initializing new machine key: %w", err)
+		}
+	}
+
+	keyText, _ = b.machinePrivKey.MarshalText()
+	if err := b.store.WriteState(MachineKeyStateKey, keyText); err != nil {
+		b.logf("error writing machine key to store: %v", err)
+		return err
+	}
+
+	b.logf("machine key written to store")
+	return nil
+}
+
+// writeServerModeStartState stores the ServerModeStartKey value based on the current
+// user and prefs. If userID is blank or prefs is blank, no work is done.
+//
+// b.mu may either be held or not.
+func (b *LocalBackend) writeServerModeStartState(userID string, prefs *Prefs) {
+	if userID == "" || prefs == nil {
+		return
+	}
+
+	if prefs.ForceDaemon {
+		stateKey := StateKey("user-" + userID)
+		if err := b.store.WriteState(ServerModeStartKey, []byte(stateKey)); err != nil {
+			b.logf("WriteState error: %v", err)
+		}
+		// It's important we do this here too, even if it looks
+		// redundant with the one in the 'if stateKey != ""'
+		// check block above. That one won't fire in the case
+		// where the Windows client started up in client mode.
+		// This happens when we transition into server mode:
+		if err := b.store.WriteState(stateKey, prefs.ToBytes()); err != nil {
+			b.logf("WriteState error: %v", err)
+		}
+	} else {
+		if err := b.store.WriteState(ServerModeStartKey, nil); err != nil {
+			b.logf("WriteState error: %v", err)
+		}
+	}
+}
+
 // loadStateLocked sets b.prefs and b.stateKey based on a complex
 // combination of key, prefs, and legacyPath. b.mu must be held when
 // calling.
-func (b *LocalBackend) loadStateLocked(key StateKey, prefs *Prefs, legacyPath string) error {
+func (b *LocalBackend) loadStateLocked(key StateKey, prefs *Prefs, legacyPath string) (err error) {
 	if prefs == nil && key == "" {
 		panic("state key and prefs are both unset")
 	}
 
+	// Optimistically set stateKey (for initMachineKeyLocked's
+	// logging), but revert it if we return an error so a later SetPrefs
+	// call can't pick it up if it's bogus.
+	b.stateKey = key
+	defer func() {
+		if err != nil {
+			b.stateKey = ""
+		}
+	}()
+
 	if key == "" {
-		// Frontend fully owns the state, we just need to obey it.
-		b.logf("Using frontend prefs")
+		// Frontend owns the state, we just need to obey it.
+		//
+		// If the frontend (e.g. on Windows) supplied the
+		// optional/legacy machine key then it's used as the
+		// value instead of making up a new one.
+		b.logf("using frontend prefs: %s", prefs.Pretty())
 		b.prefs = prefs.Clone()
-		b.stateKey = ""
+		if err := b.initMachineKeyLocked(); err != nil {
+			return fmt.Errorf("initMachineKeyLocked: %w", err)
+		}
+		b.writeServerModeStartState(b.userID, b.prefs)
 		return nil
 	}
 
 	if prefs != nil {
 		// Backend owns the state, but frontend is trying to migrate
 		// state into the backend.
-		b.logf("Importing frontend prefs into backend store")
+		b.logf("importing frontend prefs into backend store; frontend prefs: %s", prefs.Pretty())
 		if err := b.store.WriteState(key, prefs.ToBytes()); err != nil {
 			return fmt.Errorf("store.WriteState: %v", err)
 		}
 	}
 
-	b.logf("Using backend prefs")
+	b.logf("using backend prefs")
 	bs, err := b.store.ReadState(key)
 	if err != nil {
 		if errors.Is(err, ErrStateNotExist) {
 			if legacyPath != "" {
 				b.prefs, err = LoadPrefs(legacyPath)
 				if err != nil {
-					b.logf("Failed to load legacy prefs: %v", err)
+					if !errors.Is(err, os.ErrNotExist) {
+						b.logf("failed to load legacy prefs: %v", err)
+					}
 					b.prefs = NewPrefs()
 				} else {
-					b.logf("Imported state from relaynode for %q", key)
+					b.logf("imported prefs from relaynode for %q: %v", key, b.prefs.Pretty())
 				}
 			} else {
 				b.prefs = NewPrefs()
-				b.logf("Created empty state for %q", key)
+				b.logf("created empty state for %q: %s", key, b.prefs.Pretty())
 			}
-			b.stateKey = key
+			if err := b.initMachineKeyLocked(); err != nil {
+				return fmt.Errorf("initMachineKeyLocked: %w", err)
+			}
 			return nil
 		}
 		return fmt.Errorf("store.ReadState(%q): %v", key, err)
@@ -671,7 +876,10 @@ func (b *LocalBackend) loadStateLocked(key StateKey, prefs *Prefs, legacyPath st
 	if err != nil {
 		return fmt.Errorf("PrefsFromBytes: %v", err)
 	}
-	b.stateKey = key
+	b.logf("backend prefs for %q: %s", key, b.prefs.Pretty())
+	if err := b.initMachineKeyLocked(); err != nil {
+		return fmt.Errorf("initMachineKeyLocked: %w", err)
+	}
 	return nil
 }
 
@@ -681,6 +889,12 @@ func (b *LocalBackend) State() State {
 	defer b.mu.Unlock()
 
 	return b.state
+}
+
+func (b *LocalBackend) InServerMode() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inServerMode
 }
 
 // getEngineStatus returns a copy of b.engineStatus.
@@ -710,7 +924,7 @@ func (b *LocalBackend) Login(token *oauth2.Token) {
 func (b *LocalBackend) StartLoginInteractive() {
 	b.mu.Lock()
 	b.assertClientLocked()
-	b.interact++
+	b.interact = true
 	url := b.authURL
 	c := b.c
 	b.mu.Unlock()
@@ -741,7 +955,7 @@ func (b *LocalBackend) FakeExpireAfter(x time.Duration) {
 	if e.IsZero() || time.Until(e) > x {
 		mapCopy.Expiry = time.Now().Add(x)
 	}
-	b.netMap = &mapCopy
+	b.setNetMapLocked(&mapCopy)
 	b.send(Notify{NetMap: b.netMap})
 }
 
@@ -756,28 +970,33 @@ func (b *LocalBackend) Ping(ipStr string) {
 	})
 }
 
-func (b *LocalBackend) parseWgStatus(s *wgengine.Status) (ret EngineStatus) {
-	var (
-		peerStats []string
-		peerKeys  []string
-	)
+// parseWgStatusLocked returns an EngineStatus based on s.
+//
+// b.mu must be held; mostly because the caller is about to anyway, and doing so
+// gives us slightly better guarantees about the two peers stats lines not
+// being intermixed if there are concurrent calls to our caller.
+func (b *LocalBackend) parseWgStatusLocked(s *wgengine.Status) (ret EngineStatus) {
+	var peerStats, peerKeys strings.Builder
 
 	ret.LiveDERPs = s.DERPs
 	ret.LivePeers = map[tailcfg.NodeKey]wgengine.PeerStatus{}
 	for _, p := range s.Peers {
 		if !p.LastHandshake.IsZero() {
-			peerStats = append(peerStats, fmt.Sprintf("%d/%d", p.RxBytes, p.TxBytes))
+			fmt.Fprintf(&peerStats, "%d/%d ", p.RxBytes, p.TxBytes)
+			fmt.Fprintf(&peerKeys, "%s ", p.NodeKey.ShortString())
+
 			ret.NumLive++
 			ret.LivePeers[p.NodeKey] = p
 
-			peerKeys = append(peerKeys, p.NodeKey.ShortString())
 		}
 		ret.RBytes += p.RxBytes
 		ret.WBytes += p.TxBytes
 	}
-	if len(peerStats) > 0 {
-		b.keyLogf("peer keys: %s", strings.Join(peerKeys, " "))
-		b.logf("v%v peers: %v", version.LONG, strings.Join(peerStats, " "))
+
+	// [GRINDER STATS LINES] - please don't remove (used for log parsing)
+	if peerStats.Len() > 0 {
+		b.keyLogf("peer keys: %s", strings.TrimSpace(peerKeys.String()))
+		b.statsLogf("v%v peers: %v", version.Long, strings.TrimSpace(peerStats.String()))
 	}
 	return ret
 }
@@ -794,10 +1013,28 @@ func (b *LocalBackend) shieldsAreUp() bool {
 	return b.prefs.ShieldsUp
 }
 
+func (b *LocalBackend) SetCurrentUserID(uid string) {
+	b.mu.Lock()
+	b.userID = uid
+	b.mu.Unlock()
+}
+
+func (b *LocalBackend) SetWantRunning(wantRunning bool) {
+	b.mu.Lock()
+	new := b.prefs.Clone()
+	b.mu.Unlock()
+	if new.WantRunning == wantRunning {
+		return
+	}
+	new.WantRunning = wantRunning
+	b.logf("SetWantRunning: %v", wantRunning)
+	b.SetPrefs(new)
+}
+
 // SetPrefs saves new user preferences and propagates them throughout
 // the system. Implements Backend.
-func (b *LocalBackend) SetPrefs(new *Prefs) {
-	if new == nil {
+func (b *LocalBackend) SetPrefs(newp *Prefs) {
+	if newp == nil {
 		panic("SetPrefs got nil prefs")
 	}
 
@@ -806,50 +1043,64 @@ func (b *LocalBackend) SetPrefs(new *Prefs) {
 	netMap := b.netMap
 	stateKey := b.stateKey
 
-	old := b.prefs
-	new.Persist = old.Persist // caller isn't allowed to override this
-	b.prefs = new
+	oldp := b.prefs
+	newp.Persist = oldp.Persist // caller isn't allowed to override this
+	b.prefs = newp
+	b.inServerMode = newp.ForceDaemon
 	// We do this to avoid holding the lock while doing everything else.
-	new = b.prefs.Clone()
+	newp = b.prefs.Clone()
 
 	oldHi := b.hostinfo
 	newHi := oldHi.Clone()
 	newHi.RoutableIPs = append([]wgcfg.CIDR(nil), b.prefs.AdvertiseRoutes...)
-	applyPrefsToHostinfo(newHi, new)
+	applyPrefsToHostinfo(newHi, newp)
 	b.hostinfo = newHi
 	hostInfoChanged := !oldHi.Equal(newHi)
+	userID := b.userID
 
 	b.mu.Unlock()
 
 	if stateKey != "" {
-		if err := b.store.WriteState(stateKey, new.ToBytes()); err != nil {
+		if err := b.store.WriteState(stateKey, newp.ToBytes()); err != nil {
 			b.logf("Failed to save new controlclient state: %v", err)
 		}
 	}
+	b.writeServerModeStartState(userID, newp)
 
-	b.logf("SetPrefs: %v", new.Pretty())
+	// [GRINDER STATS LINE] - please don't remove (used for log parsing)
+	b.logf("SetPrefs: %v", newp.Pretty())
+	if netMap != nil {
+		if login := netMap.UserProfiles[netMap.User].LoginName; login != "" {
+			if newp.Persist == nil {
+				b.logf("active login: %s", login)
+			} else if newp.Persist.LoginName != login {
+				// Corp issue 461: sometimes the wrong prefs are
+				// logged; the frontend isn't always getting
+				// notified (to update its prefs/persist) on
+				// account switch.  Log this while we figure it
+				// out.
+				b.logf("active login: %s ([unexpected] corp#461, not %s)", newp.Persist.LoginName)
+			}
+		}
+	}
 
-	if old.ShieldsUp != new.ShieldsUp || hostInfoChanged {
+	if oldp.ShieldsUp != newp.ShieldsUp || hostInfoChanged {
 		b.doSetHostinfoFilterServices(newHi)
 	}
 
-	b.updateFilter(netMap, new)
+	b.updateFilter(netMap, newp)
 
-	turnDERPOff := new.DisableDERP && !old.DisableDERP
-	turnDERPOn := !new.DisableDERP && old.DisableDERP
-	if turnDERPOff {
-		b.e.SetDERPMap(nil)
-	} else if turnDERPOn && netMap != nil {
+	if netMap != nil {
 		b.e.SetDERPMap(netMap.DERPMap)
 	}
 
-	if old.WantRunning != new.WantRunning {
+	if oldp.WantRunning != newp.WantRunning {
 		b.stateMachine()
 	} else {
 		b.authReconfig()
 	}
 
-	b.send(Notify{Prefs: new})
+	b.send(Notify{Prefs: newp})
 }
 
 // doSetHostinfoFilterServices calls SetHostinfo on the controlclient,
@@ -902,6 +1153,8 @@ func (b *LocalBackend) authReconfig() {
 	blocked := b.blocked
 	uc := b.prefs
 	nm := b.netMap
+	hasPAC := b.prevIfState.HasPAC()
+	disableSubnetsIfPAC := nm != nil && nm.Debug != nil && nm.Debug.DisableSubnetsIfPAC.EqualBool(true)
 	b.mu.Unlock()
 
 	if blocked {
@@ -922,15 +1175,15 @@ func (b *LocalBackend) authReconfig() {
 		flags |= controlclient.AllowDefaultRoute
 		// TODO(apenwarr): Make subnet routes a different pref?
 		flags |= controlclient.AllowSubnetRoutes
-		// TODO(apenwarr): Remove this once we sort out subnet routes.
-		//  Right now default routes are broken in Windows, but
-		//  controlclient doesn't properly send subnet routes. So
-		//  let's convert a default route into a subnet route in order
-		//  to allow experimentation.
-		flags |= controlclient.HackDefaultRoute
 	}
 	if uc.AllowSingleHosts {
 		flags |= controlclient.AllowSingleHosts
+	}
+	if hasPAC && disableSubnetsIfPAC {
+		if flags&controlclient.AllowSubnetRoutes != 0 {
+			b.logf("authReconfig: have PAC; disabling subnet routes")
+			flags &^= controlclient.AllowSubnetRoutes
+		}
 	}
 
 	cfg, err := nm.WGCfg(b.logf, flags)
@@ -1081,6 +1334,7 @@ func (b *LocalBackend) enterState(newState State) {
 	prefs := b.prefs
 	notify := b.notify
 	bc := b.c
+	networkUp := b.prevIfState.AnyInterfaceUp()
 	b.mu.Unlock()
 
 	if state == newState {
@@ -1093,7 +1347,7 @@ func (b *LocalBackend) enterState(newState State) {
 	}
 
 	if bc != nil {
-		bc.SetPaused(newState == Stopped)
+		bc.SetPaused(newState == Stopped || !networkUp)
 	}
 
 	switch newState {
@@ -1220,15 +1474,25 @@ func (b *LocalBackend) requestEngineStatusAndWait() {
 //  rebooting will fix it.
 func (b *LocalBackend) Logout() {
 	b.mu.Lock()
-	b.assertClientLocked()
 	c := b.c
-	b.netMap = nil
+	b.setNetMapLocked(nil)
 	b.mu.Unlock()
+
+	if c == nil {
+		// Double Logout can happen via repeated IPN
+		// connections to ipnserver making it repeatedly
+		// transition from 1->0 total connections, which on
+		// Windows by default ("client mode") causes a Logout
+		// on the transition to zero.
+		// Previously this crashed when we asserted that c was non-nil
+		// here.
+		return
+	}
 
 	c.Logout()
 
 	b.mu.Lock()
-	b.netMap = nil
+	b.setNetMapLocked(nil)
 	b.mu.Unlock()
 
 	b.stateMachine()
@@ -1257,19 +1521,52 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 	c.SetNetInfo(ni)
 }
 
+func (b *LocalBackend) setNetMapLocked(nm *controlclient.NetworkMap) {
+	var login string
+	if nm != nil {
+		login = nm.UserProfiles[nm.User].LoginName
+		if login == "" {
+			login = "<missing-profile>"
+		}
+	}
+	b.netMap = nm
+	if login != b.activeLogin {
+		b.logf("active login: %v", login)
+		b.activeLogin = login
+	}
+}
+
 // TestOnlyPublicKeys returns the current machine and node public
 // keys. Used in tests only to facilitate automated node authorization
 // in the test harness.
 func (b *LocalBackend) TestOnlyPublicKeys() (machineKey tailcfg.MachineKey, nodeKey tailcfg.NodeKey) {
 	b.mu.Lock()
 	prefs := b.prefs
+	machinePrivKey := b.machinePrivKey
 	b.mu.Unlock()
 
-	if prefs == nil {
+	if prefs == nil || machinePrivKey.IsZero() {
 		return
 	}
 
-	mk := prefs.Persist.PrivateMachineKey.Public()
+	mk := machinePrivKey.Public()
 	nk := prefs.Persist.PrivateNodeKey.Public()
 	return tailcfg.MachineKey(mk), tailcfg.NodeKey(nk)
+}
+
+// temporarilySetMachineKeyInPersist reports whether we should set
+// the machine key in Prefs.Persist.LegacyFrontendPrivateMachineKey
+// for the frontend to write out to its preferences for use later.
+//
+// TODO: remove this in Tailscale 1.3.x (so it effectively always
+// returns false). It just exists so users can downgrade from 1.2.x to
+// 1.0.x.  But eventually we want to stop sending the machine key to
+// clients. We can't do that until 1.0.x is no longer supported.
+func temporarilySetMachineKeyInPersist() bool {
+	//lint:ignore S1008 for comments
+	if runtime.GOOS == "darwin" || runtime.GOOS == "android" {
+		// iOS, macOS, Android users can't downgrade anyway.
+		return false
+	}
+	return true
 }

@@ -40,6 +40,7 @@ import (
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/disco"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
@@ -113,11 +114,13 @@ type Conn struct {
 	pconn4           *RebindingUDPConn
 	pconn6           *RebindingUDPConn // non-nil if IPv6 available
 	epFunc           func(endpoints []string)
+	derpActiveFunc   func()
 	logf             logger.Logf
 	sendLogLimit     *rate.Limiter
 	netChecker       *netcheck.Client
 	idleFunc         func() time.Duration   // nil means unknown
 	noteRecvActivity func(tailcfg.DiscoKey) // or nil, see Options.NoteRecvActivity
+	simulatedNetwork bool
 
 	// bufferedIPv4From and bufferedIPv4Packet are owned by
 	// ReceiveIPv4, and used when both a DERP and IPv4 packet arrive
@@ -207,6 +210,11 @@ type Conn struct {
 	// necessarily have a netcheck.Report and don't want to skip
 	// logging.
 	noV4, noV6 syncs.AtomicBool
+
+	// networkUp is whether the network is up (some interface is up
+	// with IPv4 or IPv6). It's used to suppress log spam and prevent
+	// new connection that'll fail.
+	networkUp syncs.AtomicBool
 }
 
 // derpRoute is a route entry for a public key, saying that a certain
@@ -281,6 +289,10 @@ type Options struct {
 	// endpoints change. The called func does not own the slice.
 	EndpointsFunc func(endpoint []string)
 
+	// DERPActiveFunc optionally provides a func to be called when
+	// a connection is made to a DERP server.
+	DERPActiveFunc func()
+
 	// IdleFunc optionally provides a func to return how long
 	// it's been since a TUN packet was sent or received.
 	IdleFunc func() time.Duration
@@ -296,11 +308,18 @@ type Options struct {
 	// sole user just doesn't need or want it called on every
 	// packet, just every minute or two for Wireguard timeouts,
 	// and 10 seconds seems like a good trade-off between often
-	// enough and not too often.) The provided func is called while
-	// holding userspaceEngine.wgLock and likely calls
-	// Conn.CreateEndpoint, which acquires Conn.mu. As such, you should
-	// not hold
+	// enough and not too often.) The provided func is called
+	// while holding userspaceEngine.wgLock and likely calls
+	// Conn.CreateEndpoint, which acquires Conn.mu. As such, you
+	// should not hold Conn.mu while calling it.
 	NoteRecvActivity func(tailcfg.DiscoKey)
+
+	// SimulatedNetwork can be set true in tests to signal that
+	// the network is simulated and thus it's okay to bind on the
+	// unspecified address (which we'd normally avoid to avoid
+	// triggering macOS and Windows firwall dialog boxes during
+	// "go test").
+	SimulatedNetwork bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -315,6 +334,13 @@ func (o *Options) endpointsFunc() func([]string) {
 		return func([]string) {}
 	}
 	return o.EndpointsFunc
+}
+
+func (o *Options) derpActiveFunc() func() {
+	if o == nil || o.DERPActiveFunc == nil {
+		return func() {}
+	}
+	return o.DERPActiveFunc
 }
 
 // newConn is the error-free, network-listening-side-effect-free based
@@ -333,6 +359,7 @@ func newConn() *Conn {
 		discoOfAddr:     make(map[netaddr.IPPort]tailcfg.DiscoKey),
 	}
 	c.muCond = sync.NewCond(&c.mu)
+	c.networkUp.Set(true) // assume up until told otherwise
 	return c
 }
 
@@ -346,9 +373,11 @@ func NewConn(opts Options) (*Conn, error) {
 	c.pconnPort = opts.Port
 	c.logf = opts.logf()
 	c.epFunc = opts.endpointsFunc()
+	c.derpActiveFunc = opts.derpActiveFunc()
 	c.idleFunc = opts.IdleFunc
 	c.packetListener = opts.PacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
+	c.simulatedNetwork = opts.SimulatedNetwork
 
 	if err := c.initialBind(); err != nil {
 		return nil, err
@@ -356,8 +385,9 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
 	c.netChecker = &netcheck.Client{
-		Logf:         logger.WithPrefix(c.logf, "netcheck: "),
-		GetSTUNConn4: func() netcheck.STUNConn { return c.pconn4 },
+		Logf:                logger.WithPrefix(c.logf, "netcheck: "),
+		GetSTUNConn4:        func() netcheck.STUNConn { return c.pconn4 },
+		SkipExternalNetwork: inTest(),
 	}
 	if c.pconn6 != nil {
 		c.netChecker.GetSTUNConn6 = func() netcheck.STUNConn { return c.pconn6 }
@@ -418,7 +448,7 @@ func (c *Conn) updateEndpoints(why string) {
 		return
 	}
 
-	if c.setEndpoints(endpoints) {
+	if c.setEndpoints(endpoints, reasons) {
 		c.logEndpointChange(endpoints, reasons)
 		c.epFunc(endpoints)
 	}
@@ -426,9 +456,31 @@ func (c *Conn) updateEndpoints(why string) {
 
 // setEndpoints records the new endpoints, reporting whether they're changed.
 // It takes ownership of the slice.
-func (c *Conn) setEndpoints(endpoints []string) (changed bool) {
+func (c *Conn) setEndpoints(endpoints []string, reasons map[string]string) (changed bool) {
+	anySTUN := false
+	for _, reason := range reasons {
+		if reason == "stun" {
+			anySTUN = true
+		}
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if !anySTUN && c.derpMap == nil && !inTest() {
+		// Don't bother storing or reporting this yet. We
+		// don't have a DERP map or any STUN entries, so we're
+		// just starting up. A DERP map should arrive shortly
+		// and then we'll have more interesting endpoints to
+		// report. This saves a map update.
+		// TODO(bradfitz): this optimization is currently
+		// skipped during the e2e tests because they depend
+		// too much on the exact sequence of updates.  Fix the
+		// tests. But a protocol rewrite might happen first.
+		c.logf("magicsock: ignoring pre-DERP map, STUN-less endpoint update: %v", endpoints)
+		return false
+	}
+
 	if stringsEqual(endpoints, c.lastEndpoints) {
 		return false
 	}
@@ -441,7 +493,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	dm := c.derpMap
 	c.mu.Unlock()
 
-	if dm == nil {
+	if dm == nil || c.networkDown() {
 		return new(netcheck.Report), nil
 	}
 
@@ -635,8 +687,8 @@ func (c *Conn) Ping(ip netaddr.IP, cb func(*ipnstate.PingResult)) {
 	}
 
 	dk, ok := c.discoOfNode[peer.Key]
-	if !ok {
-		res.Err = "no discovery key for peer (pre 0.100?)"
+	if !ok { // peer is using outdated Tailscale version (pre-0.100)
+		res.Err = "no discovery key for peer (pre Tailscale 0.100 version?). Try: ping 100.x.y.z"
 		cb(res)
 		return
 	}
@@ -956,8 +1008,15 @@ func (as *AddrSet) appendDests(dsts []netaddr.IPPort, b []byte) (_ []netaddr.IPP
 }
 
 var errNoDestinations = errors.New("magicsock: no destinations")
+var errNetworkDown = errors.New("magicsock: network down")
+
+func (c *Conn) networkDown() bool { return !c.networkUp.Get() }
 
 func (c *Conn) Send(b []byte, ep conn.Endpoint) error {
+	if c.networkDown() {
+		return errNetworkDown
+	}
+
 	var as *AddrSet
 	switch v := ep.(type) {
 	default:
@@ -1098,6 +1157,10 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 	}
 	regionID := int(addr.Port)
 
+	if c.networkDown() {
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.wantDerpLocked() || c.closed {
@@ -1206,6 +1269,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netaddr.IPPort, peer key.Public) chan<- 
 
 	go c.runDerpReader(ctx, addr, dc, wg, startGate)
 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
+	go c.derpActiveFunc()
 
 	return ad.writeCh
 }
@@ -1287,36 +1351,45 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netaddr.IPPort, d
 	// peerPresent is the set of senders we know are present on this
 	// connection, based on messages we've received from the server.
 	peerPresent := map[key.Public]bool{}
-
+	bo := backoff.NewBackoff(fmt.Sprintf("derp-%d", regionID), c.logf, 5*time.Second)
 	for {
 		msg, err := dc.Recv()
-		if err == derphttp.ErrClientClosed {
-			return
-		}
 		if err != nil {
 			// Forget that all these peers have routes.
 			for peer := range peerPresent {
 				delete(peerPresent, peer)
 				c.removeDerpPeerRoute(peer, regionID, dc)
 			}
+			if err == derphttp.ErrClientClosed {
+				return
+			}
+			if c.networkDown() {
+				c.logf("magicsock: derp.Recv(derp-%d): network down, closing", regionID)
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			c.ReSTUN("derp-close")
+
 			c.logf("magicsock: [%p] derp.Recv(derp-%d): %v", dc, regionID, err)
 
-			// Avoid excessive spinning.
-			// TODO: use a backoff timer, perhaps between 10ms and 500ms?
-			// Don't want to sleep too long. For now 250ms seems fine.
+			// If our DERP connection broke, it might be because our network
+			// conditions changed. Start that check.
+			c.ReSTUN("derp-recv-error")
+
+			// Back off a bit before reconnecting.
+			bo.BackOff(ctx, err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(250 * time.Millisecond):
+			default:
 			}
 			continue
 		}
+		bo.BackOff(ctx, nil) // reset
+
 		switch m := msg.(type) {
 		case derp.ReceivedPacket:
 			pkt = m
@@ -1677,7 +1750,9 @@ func (c *Conn) sendDiscoMessage(dst netaddr.IPPort, dstKey tailcfg.NodeKey, dstD
 	} else if err == nil {
 		// Can't send. (e.g. no IPv6 locally)
 	} else {
-		c.logf("magicsock: disco: failed to send %T to %v: %v", m, dst, err)
+		if !c.networkDown() {
+			c.logf("magicsock: disco: failed to send %T to %v: %v", m, dst, err)
+		}
 	}
 	return sent, err
 }
@@ -1751,6 +1826,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netaddr.IPPort) bool {
 		needsRecvActivityCall = de.isFirstRecvActivityInAwhile()
 	}
 	if needsRecvActivityCall && c.noteRecvActivity != nil {
+		c.logf("magicsock: got disco message from idle peer, starting lazy conf for %v, %v", peerNode.Key.ShortString(), sender.ShortString())
 		// We can't hold Conn.mu while calling noteRecvActivity.
 		// noteRecvActivity acquires userspaceEngine.wgLock (and per our
 		// lock ordering rules: wgLock must come first), and also calls
@@ -1939,6 +2015,21 @@ func (c *Conn) sharedDiscoKeyLocked(k tailcfg.DiscoKey) *[32]byte {
 	box.Precompute(shared, key.Public(k).B32(), c.discoPrivate.B32())
 	c.sharedDiscoKey[k] = shared
 	return shared
+}
+
+func (c *Conn) SetNetworkUp(up bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.networkUp.Get() == up {
+		return
+	}
+
+	c.logf("magicsock: SetNetworkUp(%v)", up)
+	c.networkUp.Set(up)
+
+	if !up {
+		c.closeAllDerpLocked("network-down")
+	}
 }
 
 // SetPrivateKey sets the connection's private key.
@@ -2267,6 +2358,10 @@ func maxIdleBeforeSTUNShutdown() time.Duration {
 }
 
 func (c *Conn) shouldDoPeriodicReSTUN() bool {
+	if c.networkDown() {
+		return false
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.peerSet) == 0 {
@@ -2395,8 +2490,11 @@ func (c *Conn) listenPacket(ctx context.Context, network, addr string) (net.Pack
 
 func (c *Conn) bind1(ruc **RebindingUDPConn, which string) error {
 	host := ""
-	if inTest() {
+	if inTest() && !c.simulatedNetwork {
 		host = "127.0.0.1"
+		if which == "udp6" {
+			host = "::1"
+		}
 	}
 	var pc net.PacketConn
 	var err error
@@ -2425,7 +2523,7 @@ func (c *Conn) bind1(ruc **RebindingUDPConn, which string) error {
 // It should be followed by a call to ReSTUN.
 func (c *Conn) Rebind() {
 	host := ""
-	if inTest() {
+	if inTest() && !c.simulatedNetwork {
 		host = "127.0.0.1"
 	}
 	listenCtx := context.Background() // unused without DNS name to resolve
@@ -2767,7 +2865,7 @@ func (c *Conn) CreateBind(uint16) (conn.Bind, uint16, error) {
 //
 // The key is the public key of the peer and addrs is either:
 //
-//  1) a comma-separated list of UDP ip:ports (the the peer doesn't have a discovery key)
+//  1) a comma-separated list of UDP ip:ports (the peer doesn't have a discovery key)
 //  2) "<hex-discovery-key>.disco.tailscale:12345", a magic value that means the peer
 //     is running code that supports active discovery, so CreateEndpoint returns
 //     a discoEndpoint.
@@ -3020,6 +3118,21 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	ss := &ipnstate.PeerStatus{
+		PublicKey: c.privateKey.Public(),
+		Addrs:     c.lastEndpoints,
+	}
+	if c.netMap != nil {
+		ss.HostName = c.netMap.Hostinfo.Hostname
+		ss.OS = c.netMap.Hostinfo.OS
+	}
+	if c.derpMap != nil {
+		derpRegion, ok := c.derpMap.Regions[c.myDerp]
+		if ok {
+			ss.Relay = derpRegion.RegionCode
+		}
+	}
+
 	if c.netMap != nil {
 		for _, addr := range c.netMap.Addresses {
 			if (addr.IP.Is4() && addr.Mask != 32) || (addr.IP.Is6() && addr.Mask != 128) {
@@ -3027,9 +3140,11 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 			}
 			if ip, ok := netaddr.FromStdIP(addr.IP.IP()); ok {
 				sb.AddTailscaleIP(ip)
+				ss.TailAddr = ip.String()
 			}
 		}
 	}
+	sb.SetSelfStatus(ss)
 
 	for dk, n := range c.nodeOfDisco {
 		ps := &ipnstate.PeerStatus{InMagicSock: true}
@@ -3433,6 +3548,7 @@ func (de *discoEndpoint) sendDiscoPing(ep netaddr.IPPort, txid stun.TxID, logLev
 // discoPingPurpose is the reason why a discovery ping message was sent.
 type discoPingPurpose int
 
+//go:generate stringer -type=discoPingPurpose -trimprefix=ping
 const (
 	// pingDiscovery means that purpose of a ping was to see if a
 	// path was valid.

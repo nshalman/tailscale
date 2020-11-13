@@ -21,6 +21,7 @@ type State int
 
 const (
 	NoState = State(iota)
+	InUseOtherUser
 	NeedsLogin
 	NeedsMachineAuth
 	Stopped
@@ -33,8 +34,14 @@ const (
 const GoogleIDTokenType = "ts_android_google_login"
 
 func (s State) String() string {
-	return [...]string{"NoState", "NeedsLogin", "NeedsMachineAuth",
-		"Stopped", "Starting", "Running"}[s]
+	return [...]string{
+		"NoState",
+		"InUseOtherUser",
+		"NeedsLogin",
+		"NeedsMachineAuth",
+		"Stopped",
+		"Starting",
+		"Running"}[s]
 }
 
 // EngineStatus contains WireGuard engine stats.
@@ -53,7 +60,7 @@ type EngineStatus struct {
 type Notify struct {
 	_             structs.Incomparable
 	Version       string                    // version number of IPN backend
-	ErrMessage    *string                   // critical error message, if any
+	ErrMessage    *string                   // critical error message, if any; for InUseOtherUser, the details
 	LoginFinished *empty.Message            // event: non-nil when login process succeeded
 	State         *State                    // current IPN state has changed
 	Prefs         *Prefs                    // preferences were changed
@@ -81,14 +88,14 @@ type Notify struct {
 // shared by several consecutive users. Ideally we would just use the
 // username of the connected frontend as the StateKey.
 //
-// However, on Windows, there seems to be no safe way to figure out
-// the owning user of a process connected over IPC mechanisms
-// (sockets, named pipes). So instead, on Windows, we use a
-// capability-oriented system where the frontend generates a random
-// identifier for itself, and uses that as the StateKey when talking
-// to the backend. That way, while we can't identify an OS user by
-// name, we can tell two different users apart, because they'll have
-// different opaque state keys (and no access to each others's keys).
+// Various platforms currently set StateKey in different ways:
+//
+// * the macOS/iOS GUI apps set it to "ipn-go-bridge"
+// * the Android app sets it to "ipn-android"
+// * on Windows, it's the empty string (in client mode) or, via
+//   LocalBackend.userID, a string like "user-$USER_ID" (used in
+//   server mode).
+// * on Linux/etc, it's always "_daemon" (ipn.GlobalDaemonStateKey)
 type StateKey string
 
 type Options struct {
@@ -97,7 +104,8 @@ type Options struct {
 	// StateKey and Prefs together define the state the backend should
 	// use:
 	//  - StateKey=="" && Prefs!=nil: use Prefs for internal state,
-	//    don't persist changes in the backend.
+	//    don't persist changes in the backend, except for the machine key
+	//    for migration purposes.
 	//  - StateKey!="" && Prefs==nil: load the given backend-side
 	//    state and use/update that.
 	//  - StateKey!="" && Prefs!=nil: like the previous case, but do
@@ -144,6 +152,9 @@ type Backend interface {
 	// WantRunning. This may cause the wireguard engine to
 	// reconfigure or stop.
 	SetPrefs(*Prefs)
+	// SetWantRunning is like SetPrefs but sets only the
+	// WantRunning field.
+	SetWantRunning(wantRunning bool)
 	// RequestEngineStatus polls for an update from the wireguard
 	// engine. Only needed if you want to display byte
 	// counts. Connection events are emitted automatically without

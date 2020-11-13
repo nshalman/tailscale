@@ -8,11 +8,14 @@ import (
 	"bufio"
 	"context"
 	crand "crypto/rand"
+	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"reflect"
 	"sync"
@@ -30,6 +33,22 @@ func newPrivateKey(tb testing.TB) (k key.Private) {
 		tb.Fatal(err)
 	}
 	return
+}
+
+func TestClientInfoUnmarshal(t *testing.T) {
+	for i, in := range []string{
+		`{"Version":5,"MeshKey":"abc"}`,
+		`{"version":5,"meshKey":"abc"}`,
+	} {
+		var got clientInfo
+		if err := json.Unmarshal([]byte(in), &got); err != nil {
+			t.Fatalf("[%d]: %v", i, err)
+		}
+		want := clientInfo{Version: 5, MeshKey: "abc"}
+		if got != want {
+			t.Errorf("[%d]: got %+v; want %+v", i, got, want)
+		}
+	}
 }
 
 func TestSendRecv(t *testing.T) {
@@ -752,6 +771,24 @@ func TestForwarderRegistration(t *testing.T) {
 	want(map[key.Public]PacketForwarder{
 		u1: testFwd(3),
 	})
+}
+
+func TestMetaCert(t *testing.T) {
+	priv := newPrivateKey(t)
+	pub := priv.Public()
+	s := NewServer(priv, t.Logf)
+
+	certBytes := s.MetaCert()
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if fmt.Sprint(cert.SerialNumber) != fmt.Sprint(ProtocolVersion) {
+		t.Errorf("serial = %v; want %v", cert.SerialNumber, ProtocolVersion)
+	}
+	if g, w := cert.Subject.CommonName, fmt.Sprintf("derpkey%x", pub[:]); g != w {
+		t.Errorf("CommonName = %q; want %q", g, w)
+	}
 }
 
 func BenchmarkSendRecv(b *testing.B) {
