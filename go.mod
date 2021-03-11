@@ -43,3 +43,7 @@ require (
 	inet.af/peercred v0.0.0-20210302202138-56e694897155
 	rsc.io/goversion v1.2.0
 )
+
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20210311201620-12ea611e20d8
+
+replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20210311192659-84f9af4dae6d

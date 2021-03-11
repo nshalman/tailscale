@@ -1377,6 +1377,8 @@ func diagnoseTUNFailure(tunName string, logf logger.Logf) {
 		diagnoseLinuxTUNFailure(tunName, logf)
 	case "darwin":
 		diagnoseDarwinTUNFailure(tunName, logf)
+	case "illumos":
+		diagnoseIllumosTUNFailure(tunName, logf)
 	default:
 		logf("no TUN failure diagnostics for OS %q", runtime.GOOS)
 	}
@@ -1388,6 +1390,15 @@ func diagnoseDarwinTUNFailure(tunName string, logf logger.Logf) {
 	}
 	if tunName != "utun" {
 		logf("failed to create TUN device %q; try using tun device \"utun\" instead for automatic selection", tunName)
+	}
+}
+
+func diagnoseIllumosTUNFailure(tunName string, logf logger.Logf) {
+	if os.Getuid() != 0 {
+		logf("failed to create TUN device as non-root user; use 'sudo tailscaled'")
+	}
+	if tunName != "tun" {
+		logf("failed to create TUN device %q; try using tun device \"tun\" instead for automatic selection", tunName)
 	}
 }
 
