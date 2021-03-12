@@ -7,21 +7,21 @@
 package router
 
 import (
-	"errors"
 	"fmt"
+	"log"
+	"os/exec"
 
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"inet.af/netaddr"
 	"tailscale.com/types/logger"
-	"tailscale.com/version"
 	"tailscale.com/wgengine/router/dns"
 )
 
 type userspaceIllumosRouter struct {
 	logf    logger.Logf
 	tunname string
-	local   netaddr.IPPrefix
+	local   []netaddr.IPPrefix
 	routes  map[netaddr.IPPrefix]struct{}
 
 	dns *dns.Manager
@@ -45,57 +45,94 @@ func newUserspaceIllumosRouter(logf logger.Logf, _ *device.Device, tundev tun.De
 	}, nil
 }
 
+func (r *userspaceIllumosRouter) addrsToRemove(newLocalAddrs []netaddr.IPPrefix) (remove []netaddr.IPPrefix) {
+	for _, cur := range r.local {
+		found := false
+		for _, v := range newLocalAddrs {
+			found = (v == cur)
+			if found {
+				break
+			}
+		}
+		if !found {
+			remove = append(remove, cur)
+		}
+	}
+	return
+}
+
+func (r *userspaceIllumosRouter) addrsToAdd(newLocalAddrs []netaddr.IPPrefix) (add []netaddr.IPPrefix) {
+	for _, cur := range newLocalAddrs {
+		found := false
+		for _, v := range r.local {
+			found = (v == cur)
+			if found {
+				break
+			}
+		}
+		if !found {
+			add = append(add, cur)
+		}
+	}
+	return
+}
+
+func cmd(args ...string) *exec.Cmd {
+	if len(args) == 0 {
+		log.Fatalf("exec.Cmd(%#v) invalid; need argv[0]", args)
+	}
+	log.Printf("%#v", args)
+	return exec.Command(args[0], args[1:]...)
+}
+
 func (r *userspaceIllumosRouter) Up() error {
-/*
 	ifup := []string{"ifconfig", r.tunname, "up"}
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
 		r.logf("running ifconfig failed: %v\n%s", err, out)
-		return err
+		// this seems to fail harmlessly on illumos
+		//return err
 	}
-*/
 	return nil
 }
 
-func (r *userspaceIllumosRouter) Set(cfg *Config) error {
+func inet(p netaddr.IPPrefix) string {
+	if p.IP.Is6() {
+		return "inet6"
+	}
+	return "inet"
+}
+
+func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 	if cfg == nil {
 		cfg = &shutdownConfig
 	}
-	if len(cfg.LocalAddrs) == 0 {
-		return nil
-	}
-	// TODO: support configuring multiple local addrs on interface.
-	if len(cfg.LocalAddrs) != 1 {
-		return errors.New("freebsd doesn't support setting multiple local addrs yet")
-	}
-	localAddr := cfg.LocalAddrs[0]
 
 	var errq error
-
-	// Update the address.
-	if localAddr != r.local {
-		// If the interface is already set, remove it.
-		if r.local != (netaddr.IPPrefix{}) {
-			addrdel := []string{"ifconfig", r.tunname,
-				"inet", r.local.String(), "-alias"}
-			out, err := cmd(addrdel...).CombinedOutput()
-			if err != nil {
-				r.logf("addr del failed: %v: %v\n%s", addrdel, err, out)
-				if errq == nil {
-					errq = err
-				}
-			}
+	setErr := func(err error) {
+		if errq == nil {
+			errq = err
 		}
+	}
 
-		// Add the interface.
-		addradd := []string{"ifconfig", r.tunname,
-			"inet", localAddr.String(), localAddr.IP.String()}
-		out, err := cmd(addradd...).CombinedOutput()
+	// Update the addresses.
+	for _, addr := range r.addrsToRemove(cfg.LocalAddrs) {
+		arg := []string{"ifconfig", r.tunname, inet(addr), addr.String(), "-alias"}
+		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
-			r.logf("addr add failed: %v: %v\n%s", addradd, err, out)
-			if errq == nil {
-				errq = err
-			}
+			r.logf("addr del failed: %v => %v\n%s", arg, err, out)
+			setErr(err)
 		}
+	}
+	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
+		var arg = []string{"ifconfig", r.tunname, inet(addr), addr.String(), addr.IP.String(), "up"}
+		out, err := cmd(arg...).CombinedOutput()
+		if err != nil {
+			r.logf("addr add failed: %v => %v\n%s", arg, err, out)
+			setErr(err)
+		}
+		var arg2 = []string{"ifconfig"}
+		out, err = cmd(arg2...).CombinedOutput()
+		r.logf("%v => %v\n%s", arg, err, out)
 	}
 
 	newRoutes := make(map[netaddr.IPPrefix]struct{})
@@ -109,54 +146,50 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) error {
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits)
 			del := "del"
-			if version.OS() == "macOS" {
-				del = "delete"
-			}
 			routedel := []string{"route", "-q", "-n",
-				del, "-inet", nstr,
-				localAddr.IP.String(), "-iface"}
+				del, "-" + inet(route), nstr,
+				"-iface", r.tunname}
 			out, err := cmd(routedel...).CombinedOutput()
 			if err != nil {
 				r.logf("route del failed: %v: %v\n%s", routedel, err, out)
-				if errq == nil {
-					errq = err
-				}
+				setErr(err)
 			}
 		}
 	}
 	// Add the routes.
+/* FIXME
+    0  75608  75606 ifconfig tun0 inet 100.73.180.15/32 100.73.180.15
+    0  75609  75606 route -q -n add 100.99.51.82/32 100.73.180.15 -iface
+    0  75610  75606 route -q -n add 100.118.4.4/32 100.73.180.15 -iface
+    0  75611  75606 route -q -n add 100.125.73.90/32 100.73.180.15 -iface
+    0  75612  75606 route -q -n add 100.100.100.100/32 100.73.180.15 -iface
+    0  75613  75606 ifconfig tun0 up
+*/
 	for route := range newRoutes {
 		if _, exists := r.routes[route]; !exists {
 			net := route.IPNet()
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits)
 			routeadd := []string{"route", "-q", "-n",
-				"add", nstr,
-				localAddr.IP.String(), "-iface"}
+				"add", "-" + inet(route), nstr,
+				"-ifp", r.tunname, "100.73.180.15", "-iface"}
 			out, err := cmd(routeadd...).CombinedOutput()
 			if err != nil {
 				r.logf("addr add failed: %v: %v\n%s", routeadd, err, out)
-				if errq == nil {
-					errq = err
-				}
+				setErr(err)
 			}
 		}
 	}
 
-	// Bring up the interface
-	ifup := []string{"ifconfig", r.tunname, "up"}
-	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
-		r.logf("running ifconfig failed: %v\n%s", err, out)
-		return err
-	}
-	return nil
-
 	// Store the interface and routes so we know what to change on an update.
-	r.local = localAddr
+	if errq == nil {
+		r.local = append([]netaddr.IPPrefix{}, cfg.LocalAddrs...)
+	}
 	r.routes = newRoutes
 
 	if err := r.dns.Set(cfg.DNS); err != nil {
-		errq = fmt.Errorf("dns set: %v", err)
+		r.logf("DNS set: %v", err)
+		setErr(err)
 	}
 
 	return errq
