@@ -2,9 +2,23 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// +build illumos
+
 package logger
 
+import (
+	"golang.org/x/sys/unix"
+)
+
 func rusageMaxRSS() float64 {
-	// TODO: Substitute illumos equivalent of Getrusage() here.
-	return 0
+	var ru unix.Rusage
+	err := unix.Getrusage(unix.RUSAGE_SELF, &ru)
+	if err != nil {
+		return 0
+	}
+
+	rss := float64(ru.Maxrss)
+	// ru_maxrss is kilobytes elsewhere (linux, openbsd, etc)
+	rss /= 1 << 10
+	return rss
 }
