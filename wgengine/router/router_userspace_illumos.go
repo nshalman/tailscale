@@ -81,7 +81,6 @@ func cmd(args ...string) *exec.Cmd {
 	if len(args) == 0 {
 		log.Fatalf("exec.Cmd(%#v) invalid; need argv[0]", args)
 	}
-	log.Printf("%#v", args)
 	return exec.Command(args[0], args[1:]...)
 }
 
@@ -173,15 +172,6 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 			}
 		}
 	}
-	// Add the routes.
-/* FIXME
-    0  75608  75606 ifconfig tun0 inet 100.73.180.15/32 100.73.180.15
-    0  75609  75606 route -q -n add 100.99.51.82/32 100.73.180.15 -iface
-    0  75610  75606 route -q -n add 100.118.4.4/32 100.73.180.15 -iface
-    0  75611  75606 route -q -n add 100.125.73.90/32 100.73.180.15 -iface
-    0  75612  75606 route -q -n add 100.100.100.100/32 100.73.180.15 -iface
-    0  75613  75606 ifconfig tun0 up
-*/
 	for route := range newRoutes {
 		if _, exists := r.routes[route]; !exists {
 			net := route.IPNet()
