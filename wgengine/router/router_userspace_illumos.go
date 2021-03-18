@@ -114,7 +114,23 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 		}
 	}
 
-	// Update the addresses.
+	// illumos requires routes to have a nexthop. For routes such as
+	// ours where the nexthop is meaningless, you're supposed to use
+	// one of the local IP addresses of the interface. Find an IPv4
+	// and IPv6 address we can use for this purpose.
+	var firstGateway4 string
+	var firstGateway6 string
+	for _, addr := range cfg.LocalAddrs {
+		r.logf("NAHUM, %v, %v, %v", addr, addr.IP.Is4(), addr.IP.Is6())
+		if addr.IP.Is4() && firstGateway4 == "" {
+			firstGateway4 = addr.IP.String()
+		} else if addr.IP.Is6() && firstGateway6 == "" {
+			firstGateway6 = addr.IP.String()
+		}
+	}
+	r.logf("NAHUM, firstGateway4=%v, firstGateway6=%v", firstGateway4, firstGateway6)
+
+	// Update the addresses. TODO(nshalman)
 	for _, addr := range r.addrsToRemove(cfg.LocalAddrs) {
 		arg := []string{"ifconfig", r.tunname, inet(addr), addr.String(), "-alias"}
 		out, err := cmd(arg...).CombinedOutput()
@@ -124,7 +140,8 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 		}
 	}
 	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
-		var arg = []string{"ifconfig", r.tunname, inet(addr), addr.String(), addr.IP.String(), "up"}
+		addrString := fmt.Sprintf("local=%s,remote=%s", addr.String(), addr.IP.String())
+		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, r.tunname + "/" + inet(addr)}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
 			r.logf("addr add failed: %v => %v\n%s", arg, err, out)
@@ -139,7 +156,7 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 	for _, route := range cfg.Routes {
 		newRoutes[route] = struct{}{}
 	}
-	// Delete any pre-existing routes.
+	// Delete any pre-existing routes. TODO(nshalman)
 	for route := range r.routes {
 		if _, keep := newRoutes[route]; !keep {
 			net := route.IPNet()
@@ -170,9 +187,16 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 			net := route.IPNet()
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits)
+			var gateway string
+			if route.IP.Is4() && firstGateway4 != ""{
+				gateway = firstGateway4
+			}
+			if route.IP.Is6() && firstGateway6 != ""{
+				gateway = firstGateway6
+			}
 			routeadd := []string{"route", "-q", "-n",
 				"add", "-" + inet(route), nstr,
-				"-ifp", r.tunname, "100.73.180.15", "-iface"}
+				"-ifp", r.tunname, gateway, "-iface"}
 			out, err := cmd(routeadd...).CombinedOutput()
 			if err != nil {
 				r.logf("addr add failed: %v: %v\n%s", routeadd, err, out)
@@ -199,6 +223,6 @@ func (r *userspaceIllumosRouter) Close() error {
 	if err := r.dns.Down(); err != nil {
 		r.logf("dns down: %v", err)
 	}
-	// No interface cleanup is necessary during normal shutdown.
+	cleanup(r.logf, r.tunname)
 	return nil
 }

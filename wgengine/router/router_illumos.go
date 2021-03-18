@@ -17,16 +17,12 @@ func newUserspaceRouter(logf logger.Logf, _ *device.Device, tundev tun.Device) (
 }
 
 func cleanup(logf logger.Logf, interfaceName string) {
-	// If the interface was left behind, ifconfig down will not remove it.
-	// In fact, this will leave a system in a tainted state where starting tailscaled
-	// will result in "interface tailscale0 already exists"
-	// until the defunct interface is ifconfig-destroyed.
-	ifup := []string{"ifconfig", interfaceName, "down"}
-	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
-		logf("ifconfig down: %v\n%s", err, out)
-	}
-	ifup = []string{"ifconfig", interfaceName, "unplumb"}
-	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
+	ifcfg := []string{"ifconfig", interfaceName, "unplumb"}
+	if out, err := cmd(ifcfg...).CombinedOutput(); err != nil {
 		logf("ifconfig unplumb: %v\n%s", err, out)
+	}
+	ifcfg = []string{"ifconfig", interfaceName, "inet6", "unplumb"}
+	if out, err := cmd(ifcfg...).CombinedOutput(); err != nil {
+		logf("ifconfig inet6 unplumb: %v\n%s", err, out)
 	}
 }
