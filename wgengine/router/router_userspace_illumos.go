@@ -120,14 +120,12 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 	var firstGateway4 string
 	var firstGateway6 string
 	for _, addr := range cfg.LocalAddrs {
-		r.logf("NAHUM, %v, %v, %v", addr, addr.IP.Is4(), addr.IP.Is6())
 		if addr.IP.Is4() && firstGateway4 == "" {
 			firstGateway4 = addr.IP.String()
 		} else if addr.IP.Is6() && firstGateway6 == "" {
 			firstGateway6 = addr.IP.String()
 		}
 	}
-	r.logf("NAHUM, firstGateway4=%v, firstGateway6=%v", firstGateway4, firstGateway6)
 
 	// Update the addresses. TODO(nshalman)
 	for _, addr := range r.addrsToRemove(cfg.LocalAddrs) {
