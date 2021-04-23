@@ -235,10 +235,10 @@ github.com/modern-go/reflect2 v1.0.1/go.mod h1:bx2lNnkwVCuqBIxFjflWJWanXIb3Rllmb
 github.com/mohae/deepcopy v0.0.0-20170308212314-bb9b5e7adda9/go.mod h1:TaXosZuwdSHYgviHp1DAtfrULt5eUgsSMsZf+YrPgl8=
 github.com/munnerz/goautoneg v0.0.0-20120707110453-a547fc61f48d/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f/go.mod h1:ZdcZmHo+o7JKHSa8/e818NopupXU1YMK5fe1lsApnBw=
-github.com/nshalman/sys v0.0.0-20210318123755-e5ed8a25af52 h1:dg0CNV5eYIvm3I563nvqp9hF6vO1YmB/3gxJOPsYaxM=
-github.com/nshalman/sys v0.0.0-20210318123755-e5ed8a25af52/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20210318180243-92a4cbc748ab h1:lUksZUgmxhgU+P5YqKZFUEId3uRIlwi6edB9f9OGNxA=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20210318180243-92a4cbc748ab/go.mod h1:oSwwKXOrjmixBp9bvrTXeMqUXUIivmGE7PiGey6MB4A=
+github.com/nshalman/sys v0.0.0-20210423124517-8e1a65b46971 h1:evaMfJ+erx5NLgHzWc6WFsxDfRqdMZVpZjlRjQuNr8c=
+github.com/nshalman/sys v0.0.0-20210423124517-8e1a65b46971/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20210423141841-63a2a8dc1675 h1:P9DQ0/R17pH6KwSvP/XCmvqbgxuBR0ww9iqiXZdSgNY=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20210423141841-63a2a8dc1675/go.mod h1:j32PFepbyebJQviSWtt5arHep9XRVKrwP/s34G5ReEk=
 github.com/onsi/ginkgo v0.0.0-20170829012221-11459a886d9c/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=
 github.com/onsi/ginkgo v1.6.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=
 github.com/onsi/ginkgo v1.8.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=

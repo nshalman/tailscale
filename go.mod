@@ -43,6 +43,6 @@ require (
 	rsc.io/goversion v1.2.0
 )
 
-replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20210318180243-92a4cbc748ab
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20210423141841-63a2a8dc1675
 
-replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20210318123755-e5ed8a25af52
+replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20210423124517-8e1a65b46971
