@@ -27,11 +27,11 @@ require (
 	github.com/tcnksm/go-httpstat v0.2.0
 	github.com/toqueteos/webbrowser v1.2.0
 	go4.org/mem v0.0.0-20201119185036-c04c5a6ff174
-	golang.org/x/crypto v0.0.0-20201221181555-eec23a3978ad
-	golang.org/x/net v0.0.0-20210220033124-5f55cee0dc0d
+	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83
+	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
 	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
-	golang.org/x/sys v0.0.0-20210301091718-77cc2087c03b
+	golang.org/x/sys v0.0.0-20210426080607-c94f62235c83
 	golang.org/x/term v0.0.0-20201207232118-ee85cb95a76b
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	golang.org/x/tools v0.0.0-20201211185031-d93e913c1a58
@@ -43,6 +43,4 @@ require (
 	rsc.io/goversion v1.2.0
 )
 
-replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20210423141841-63a2a8dc1675
-
-replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20210423124517-8e1a65b46971
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20210426144136-4e15c7c21433
