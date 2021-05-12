@@ -61,6 +61,8 @@ const globalStateKey = "_daemon"
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
+	case "illumos":
+		return "tun"
 	case "openbsd":
 		return "tun"
 	case "windows":
