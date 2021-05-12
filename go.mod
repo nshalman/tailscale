@@ -43,7 +43,7 @@ require (
 	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5
 	golang.org/x/net v0.0.0-20210903162142-ad29c8ab022f
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210906170528-6f6e22806c34
+	golang.org/x/sys v0.0.0-20210910150752-751e447fb3d0
 	golang.org/x/term v0.0.0-20210503060354-a79de5458b56
 	golang.org/x/time v0.0.0-20210611083556-38a9dc6acbc6
 	golang.org/x/tools v0.1.7
@@ -197,3 +197,5 @@ require (
 	mvdan.cc/unparam v0.0.0-20200501210554-b37ab49443f7 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.0.0-20180114231543-2291e8f0f237 // indirect
 )
+
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20210917014956-e4a4030fa604
