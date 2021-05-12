@@ -47,3 +47,5 @@ require (
 	inet.af/wf v0.0.0-20210516214145-a5343001b756
 	rsc.io/goversion v1.2.0
 )
+
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20210707013850-22d6b837edc7
