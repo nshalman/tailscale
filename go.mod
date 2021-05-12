@@ -212,3 +212,5 @@ require (
 	mvdan.cc/unparam v0.0.0-20200501210554-b37ab49443f7 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.0.0-20180114231543-2291e8f0f237 // indirect
 )
+
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20211031123649-29eb2dec9962
