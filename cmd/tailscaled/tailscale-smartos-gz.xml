@@ -13,7 +13,7 @@
     <method_context>
       <method_credential group='root' user='root'/>
     </method_context>
-    <exec_method name='start' type='method' exec='/opt/local/sbin/tailscaled --state /opt/tailscale/statefile' timeout_seconds='60'>
+    <exec_method name='start' type='method' exec='/opt/local/sbin/tailscaled' timeout_seconds='60'>
       <method_context>
         <method_environment>
           <envvar name='SSL_CERT_FILE' value='/opt/tools/share/mozilla-rootcerts/cacert.pem'/>
