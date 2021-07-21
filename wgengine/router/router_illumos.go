@@ -5,6 +5,8 @@
 package router
 
 import (
+	"strings"
+
 	"golang.zx2c4.com/wireguard/tun"
 	"tailscale.com/types/logger"
 )
@@ -23,5 +25,21 @@ func cleanup(logf logger.Logf, interfaceName string) {
 	ifcfg = []string{"ifconfig", interfaceName, "inet6", "unplumb"}
 	if out, err := cmd(ifcfg...).CombinedOutput(); err != nil {
 		logf("ifconfig inet6 unplumb: %v\n%s", err, out)
+	}
+	ipadm := []string{"ipadm", "show-addr", "-p", "-o", "addrobj"}
+	out, err := cmd(ipadm...).Output()
+	if err != nil {
+		logf("ipadm show-addr: %v\n%s", err, out)
+	}
+	for _, a := range strings.Fields(string(out)) {
+		s := strings.Split(a, "/")
+		if len(s) > 1 && strings.Contains(s[1], "tailscale") {
+			ipadm = []string{"ipadm", "down-addr", "-t", a}
+			cmdVerbose(logf, ipadm)
+			ipadm = []string{"ipadm", "delete-addr", a}
+			cmdVerbose(logf, ipadm)
+			ipadm = []string{"ipadm", "delete-if", s[0]}
+			cmdVerbose(logf, ipadm)
+		}
 	}
 }

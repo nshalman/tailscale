@@ -74,6 +74,15 @@ func cmd(args ...string) *exec.Cmd {
 	return exec.Command(args[0], args[1:]...)
 }
 
+func cmdVerbose(logf logger.Logf, args []string) (string, error) {
+	o, err := cmd(args...).CombinedOutput()
+	out := string(o)
+	//if err != nil {
+		logf("cmd %v failed: %v\n%s", args, err, string(out))
+	//}
+	return out, err
+}
+
 func (r *userspaceIllumosRouter) Up() error {
 	ifup := []string{"ifconfig", r.tunname, "up"}
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
@@ -128,7 +137,7 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 	}
 	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
 		addrString := fmt.Sprintf("local=%s,remote=%s", addr.String(), addr.IP().String())
-		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, r.tunname + "/" + inet(addr)}
+		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, r.tunname + "/tailscale" + inet(addr)}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
 			r.logf("addr add failed: %v => %v\n%s", arg, err, out)
