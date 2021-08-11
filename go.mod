@@ -53,4 +53,4 @@ require (
 	rsc.io/goversion v1.2.0
 )
 
-replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20210707013850-22d6b837edc7
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20210811014313-dea5b11d6b8a

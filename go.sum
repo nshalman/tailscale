@@ -443,8 +443,8 @@ github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e h1:fD57ERR4JtEqsWb
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
 github.com/nishanths/exhaustive v0.1.0 h1:kVlMw8h2LHPMGUVqUj6230oQjjTMFjwcZrnkhXzFfl8=
 github.com/nishanths/exhaustive v0.1.0/go.mod h1:S1j9110vxV1ECdCudXRkeMnFQ/DQk9ajLT0Uf2MYZQQ=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20210707013850-22d6b837edc7 h1:IGyZyd5FV1/xSQtDRfWpt/nyLq4YufH/j5c6FEIVxNQ=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20210707013850-22d6b837edc7/go.mod h1:mekkI+Zssz+U1HAnIY7Z1L89GcRt18dmTHuoADmGo4U=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20210811014313-dea5b11d6b8a h1:PbbkGWrWpU/rq5ngkQigzKqRkVHt2zKuVkDKZUUWg78=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20210811014313-dea5b11d6b8a/go.mod h1:mekkI+Zssz+U1HAnIY7Z1L89GcRt18dmTHuoADmGo4U=
 github.com/nxadm/tail v1.4.4 h1:DQuhQpB1tVlglWS2hLQ5OV6B5r8aGxSrPc5Qo6uTN78=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/oklog/ulid v1.3.1/go.mod h1:CirwcVhetQ6Lv90oh/F+FBtV6XMibvdAFo93nm5qn4U=
