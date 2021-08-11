@@ -14,18 +14,23 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
+	"inet.af/netaddr"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/ipn"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/portmapper"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/monitor"
 )
 
@@ -33,6 +38,7 @@ var debugArgs struct {
 	monitor   bool
 	getURL    string
 	derpCheck string
+	portmap   bool
 }
 
 var debugModeFunc = debugMode // so it can be addressable
@@ -40,6 +46,7 @@ var debugModeFunc = debugMode // so it can be addressable
 func debugMode(args []string) error {
 	fs := flag.NewFlagSet("debug", flag.ExitOnError)
 	fs.BoolVar(&debugArgs.monitor, "monitor", false, "If true, run link monitor forever. Precludes all other options.")
+	fs.BoolVar(&debugArgs.portmap, "portmap", false, "If true, run portmap debugging. Precludes all other options.")
 	fs.StringVar(&debugArgs.getURL, "get-url", "", "If non-empty, fetch provided URL.")
 	fs.StringVar(&debugArgs.derpCheck, "derp", "", "if non-empty, test a DERP ping via named region code")
 	if err := fs.Parse(args); err != nil {
@@ -54,6 +61,9 @@ func debugMode(args []string) error {
 	}
 	if debugArgs.monitor {
 		return runMonitor(ctx)
+	}
+	if debugArgs.portmap {
+		return debugPortmap(ctx)
 	}
 	if debugArgs.getURL != "" {
 		return getURL(ctx, debugArgs.getURL)
@@ -190,4 +200,98 @@ func checkDerp(ctx context.Context, derpRegion string) error {
 	}
 	log.Printf("ok")
 	return err
+}
+
+func debugPortmap(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	portmapper.VerboseLogs = true
+	switch os.Getenv("TS_DEBUG_PORTMAP_TYPE") {
+	case "":
+	case "pmp":
+		portmapper.DisablePCP = true
+		portmapper.DisableUPnP = true
+	case "pcp":
+		portmapper.DisablePMP = true
+		portmapper.DisableUPnP = true
+	case "upnp":
+		portmapper.DisablePCP = true
+		portmapper.DisablePMP = true
+	default:
+		log.Fatalf("TS_DEBUG_PORTMAP_TYPE must be one of pmp,pcp,upnp")
+	}
+
+	done := make(chan bool, 1)
+
+	var c *portmapper.Client
+	logf := log.Printf
+	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), func() {
+		logf("portmapping changed.")
+		logf("have mapping: %v", c.HaveMapping())
+
+		if ext, ok := c.GetCachedMappingOrStartCreatingOne(); ok {
+			logf("cb: mapping: %v", ext)
+			select {
+			case done <- true:
+			default:
+			}
+			return
+		}
+		logf("cb: no mapping")
+	})
+	linkMon, err := monitor.New(logger.WithPrefix(logf, "monitor: "))
+	if err != nil {
+		return err
+	}
+
+	gatewayAndSelfIP := func() (gw, self netaddr.IP, ok bool) {
+		if v := os.Getenv("TS_DEBUG_GW_SELF"); strings.Contains(v, "/") {
+			i := strings.Index(v, "/")
+			gw = netaddr.MustParseIP(v[:i])
+			self = netaddr.MustParseIP(v[i+1:])
+			return gw, self, true
+		}
+		return linkMon.GatewayAndSelfIP()
+	}
+
+	c.SetGatewayLookupFunc(gatewayAndSelfIP)
+
+	gw, selfIP, ok := gatewayAndSelfIP()
+	if !ok {
+		logf("no gateway or self IP; %v", linkMon.InterfaceState())
+		return nil
+	}
+	logf("gw=%v; self=%v", gw, selfIP)
+
+	uc, err := net.ListenPacket("udp", "0.0.0.0:0")
+	if err != nil {
+		return err
+	}
+	defer uc.Close()
+	c.SetLocalPort(uint16(uc.LocalAddr().(*net.UDPAddr).Port))
+
+	res, err := c.Probe(ctx)
+	if err != nil {
+		return fmt.Errorf("Probe: %v", err)
+	}
+	logf("Probe: %+v", res)
+
+	if !res.PCP && !res.PMP && !res.UPnP {
+		logf("no portmapping services available")
+		return nil
+	}
+
+	if ext, ok := c.GetCachedMappingOrStartCreatingOne(); ok {
+		logf("mapping: %v", ext)
+	} else {
+		logf("no mapping")
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
