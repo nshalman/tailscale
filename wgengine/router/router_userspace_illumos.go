@@ -2,6 +2,7 @@
 // Use of this source code is governed by a Illumos-style
 // license that can be found in the LICENSE file.
 
+//go:build illumos
 // +build illumos
 
 package router

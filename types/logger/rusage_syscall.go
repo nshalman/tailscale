@@ -8,8 +8,8 @@
 package logger
 
 import (
-	"runtime"
 	"golang.org/x/sys/unix"
+	"runtime"
 )
 
 func rusageMaxRSS() float64 {
