@@ -2901,11 +2901,10 @@ func (b *LocalBackend) CheckIPForwarding() error {
 		ipadmCmd := "\"ipadm show-prop ipv4 -p forwarding -o CURRENT -c\""
 		bs, err := exec.Command("ipadm", "show-prop", "ipv4", "-p", "forwarding", "-o", "CURRENT", "-c").Output()
 		if err != nil {
-			warnf("couldn't check %s (%v).\nSubnet routes won't work without IP forwarding.", ipadmCmd, err)
-			return
+			return fmt.Errorf("couldn't check %s (%v).\nSubnet routes won't work without IP forwarding.", ipadmCmd, err)
 		}
 		if string(bs) != "on\n" {
-			warnf("%s is set to off. Subnet routes won't work.", ipadmCmd)
+			return fmt.Errorf("IP forwarding is set to off. Subnet routes won't work.")
 		}
 	}
 
