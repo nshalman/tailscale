@@ -2897,6 +2897,17 @@ func (b *LocalBackend) CheckIPForwarding() error {
 	if isBSD(runtime.GOOS) {
 		return fmt.Errorf("Subnet routing and exit nodes only work with additional manual configuration on %v, and is not currently officially supported.", runtime.GOOS)
 	}
+	if runtime.GOOS == "illumos" {
+		ipadmCmd := "\"ipadm show-prop ipv4 -p forwarding -o CURRENT -c\""
+		bs, err := exec.Command("ipadm", "show-prop", "ipv4", "-p", "forwarding", "-o", "CURRENT", "-c").Output()
+		if err != nil {
+			warnf("couldn't check %s (%v).\nSubnet routes won't work without IP forwarding.", ipadmCmd, err)
+			return
+		}
+		if string(bs) != "on\n" {
+			warnf("%s is set to off. Subnet routes won't work.", ipadmCmd)
+		}
+	}
 
 	var keys []string
 
