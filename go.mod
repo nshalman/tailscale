@@ -31,7 +31,7 @@ require (
 	github.com/miekg/dns v1.1.43
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/pborman/getopt v1.1.0
-	github.com/peterbourgon/ff/v3 v3.1.0
+	github.com/peterbourgon/ff/v3 v3.1.2
 	github.com/pkg/sftp v1.13.4
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tailscale/certstore v0.0.0-20210528134328-066c94b793d3
