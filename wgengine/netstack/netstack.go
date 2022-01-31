@@ -72,13 +72,15 @@ type Impl struct {
 	// It can only be set before calling Start.
 	ProcessSubnets bool
 
-	ipstack *stack.Stack
-	linkEP  *channel.Endpoint
-	tundev  *tstun.Wrapper
-	e       wgengine.Engine
-	mc      *magicsock.Conn
-	logf    logger.Logf
-	dialer  *tsdial.Dialer
+	ipstack   *stack.Stack
+	linkEP    *channel.Endpoint
+	tundev    *tstun.Wrapper
+	e         wgengine.Engine
+	mc        *magicsock.Conn
+	logf      logger.Logf
+	dialer    *tsdial.Dialer
+	ctx       context.Context    // alive until Close
+	ctxCancel context.CancelFunc // called on Close
 
 	// atomicIsLocalIPFunc holds a func that reports whether an IP
 	// is a local (non-subnet) Tailscale IP address of this
@@ -152,8 +154,14 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 		dialer:              dialer,
 		connsOpenBySubnetIP: make(map[netaddr.IP]int),
 	}
+	ns.ctx, ns.ctxCancel = context.WithCancel(context.Background())
 	ns.atomicIsLocalIPFunc.Store(tsaddr.NewContainsIPFunc(nil))
 	return ns, nil
+}
+
+func (ns *Impl) Close() error {
+	ns.ctxCancel()
+	return nil
 }
 
 // wrapProtoHandler returns protocol handler h wrapped in a version
@@ -347,8 +355,12 @@ func (ns *Impl) DialContextUDP(ctx context.Context, ipp netaddr.IPPort) (*gonet.
 
 func (ns *Impl) injectOutbound() {
 	for {
-		packetInfo, ok := ns.linkEP.ReadContext(context.Background())
+		packetInfo, ok := ns.linkEP.ReadContext(ns.ctx)
 		if !ok {
+			if ns.ctx.Err() != nil {
+				// Return without logging.
+				return
+			}
 			ns.logf("[v2] ReadContext-for-write = ok=false")
 			continue
 		}
@@ -426,6 +438,11 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 	switch runtime.GOOS {
 	case "windows":
 		err = exec.Command("ping", "-n", "1", "-w", "3000", dstIP.String()).Run()
+	case "darwin":
+		// Note: 2000 ms is actually 1 second + 2,000
+		// milliseconds extra for 3 seconds total.
+		// See https://github.com/tailscale/tailscale/pull/3753 for details.
+		err = exec.Command("ping", "-c", "1", "-W", "2000", dstIP.String()).Run()
 	case "android":
 		ping := "/system/bin/ping"
 		if dstIP.Is6() {
@@ -447,7 +464,15 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 	}
 	d := time.Since(t0)
 	if err != nil {
-		ns.logf("exec ping of %v failed in %v: %v", dstIP, d, err)
+		if d < time.Second/2 {
+			// If it failed quicker than the 3 second
+			// timeout we gave above (500 ms is a
+			// reasonable threshold), then assume the ping
+			// failed for problems finding/running
+			// ping. We don't want to log if the host is
+			// just down.
+			ns.logf("exec ping of %v failed in %v: %v", dstIP, d, err)
+		}
 		return
 	}
 	if debugNetstack {
@@ -487,6 +512,7 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 	case 6:
 		pn = header.IPv6ProtocolNumber
 	}
+	p.RemoveECNBits() // Issue 2642
 	if debugPackets {
 		ns.logf("[v2] packet in (from %v): % x", p.Src, p.Buffer())
 	}
@@ -495,6 +521,7 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 		Data: vv,
 	})
 	ns.linkEP.InjectInbound(pn, packetBuf)
+	packetBuf.DecRef()
 
 	// We've now delivered this to netstack, so we're done.
 	// Instead of returning a filter.Accept here (which would also
@@ -525,7 +552,7 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	clientRemoteIP := netaddrIPFromNetstackIP(reqDetails.RemoteAddress)
 	if !clientRemoteIP.IsValid() {
 		ns.logf("invalid RemoteAddress in TCP ForwarderRequest: %s", stringifyTEI(reqDetails))
-		r.Complete(true)
+		r.Complete(true) // sends a RST
 		return
 	}
 
@@ -541,7 +568,8 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		r.Complete(true)
+		ns.logf("CreateEndpoint error for %s: %v", stringifyTEI(reqDetails), err)
+		r.Complete(true) // sends a RST
 		return
 	}
 	r.Complete(false)
