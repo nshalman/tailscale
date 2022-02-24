@@ -505,6 +505,8 @@ func osEmoji(os string) string {
 		return "👿"
 	case "openbsd":
 		return "🐡"
+	case "illumos":
+		return "🔥"
 	}
 	return "👽"
 }
