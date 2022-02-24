@@ -3037,6 +3037,16 @@ func (b *LocalBackend) CheckIPForwarding() error {
 		return fmt.Errorf("Subnet routing and exit nodes only work with additional manual configuration on %v, and is not currently officially supported.", runtime.GOOS)
 	case runtime.GOOS == "linux":
 		return checkIPForwardingLinux()
+	case runtime.GOOS == "illumos":
+		ipadmCmd := "\"ipadm show-prop ipv4 -p forwarding -o CURRENT -c\""
+		bs, err := exec.Command("ipadm", "show-prop", "ipv4", "-p", "forwarding", "-o", "CURRENT", "-c").Output()
+		if err != nil {
+			return fmt.Errorf("couldn't check %s (%v).\nSubnet routes won't work without IP forwarding.", ipadmCmd, err)
+		}
+		if string(bs) != "on\n" {
+			return fmt.Errorf("IP forwarding is set to off. Subnet routes won't work. Try 'routeadm -u -e ipv4-forwarding'")
+		}
+		return nil
 	default:
 		// TODO: subnet routing and exit nodes probably don't work
 		// correctly on non-linux, non-netstack OSes either. Warn
