@@ -25,16 +25,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"time"
 
 	"tailscale.com/control/controlbase"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
-	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
@@ -65,7 +64,7 @@ const (
 //
 // The provided ctx is only used for the initial connection, until
 // Dial returns. It does not affect the connection once established.
-func Dial(ctx context.Context, addr string, machineKey key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16) (*controlbase.Conn, error) {
+func Dial(ctx context.Context, addr string, machineKey key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16, dialer dnscache.DialContextFunc) (*controlbase.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -79,6 +78,7 @@ func Dial(ctx context.Context, addr string, machineKey key.MachinePrivate, contr
 		controlKey: controlKey,
 		version:    protocolVersion,
 		proxyFunc:  tshttpproxy.ProxyFromEnvironment,
+		dialer:     dialer,
 	}
 	return a.dial()
 }
@@ -92,65 +92,115 @@ type dialParams struct {
 	controlKey key.MachinePublic
 	version    uint16
 	proxyFunc  func(*http.Request) (*url.URL, error) // or nil
+	dialer     dnscache.DialContextFunc
 
 	// For tests only
 	insecureTLS bool
 }
 
 func (a *dialParams) dial() (*controlbase.Conn, error) {
-	init, cont, err := controlbase.ClientDeferred(a.machineKey, a.controlKey, a.version)
-	if err != nil {
-		return nil, err
-	}
+	// Create one shared context used by both port 80 and port 443 dials.
+	// If port 80 is still in flight when 443 returns, this deferred cancel
+	// will stop the port 80 dial.
+	ctx, cancel := context.WithCancel(a.ctx)
+	defer cancel()
 
-	u := &url.URL{
+	// u80 and u443 are the URLs we'll try to hit over HTTP or HTTPS,
+	// respectively, in order to do the HTTP upgrade to a net.Conn over which
+	// we'll speak Noise.
+	u80 := &url.URL{
 		Scheme: "http",
 		Host:   net.JoinHostPort(a.host, a.httpPort),
 		Path:   serverUpgradePath,
 	}
-	conn, httpErr := a.tryURL(u, init)
-	if httpErr == nil {
-		ret, err := cont(a.ctx, conn)
-		if err != nil {
-			conn.Close()
-			return nil, err
+	u443 := &url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(a.host, a.httpsPort),
+		Path:   serverUpgradePath,
+	}
+	type tryURLRes struct {
+		u    *url.URL
+		conn net.Conn
+		cont controlbase.HandshakeContinuation
+		err  error
+	}
+	ch := make(chan tryURLRes) // must be unbuffered
+
+	try := func(u *url.URL) {
+		res := tryURLRes{u: u}
+		var init []byte
+		init, res.cont, res.err = controlbase.ClientDeferred(a.machineKey, a.controlKey, a.version)
+		if res.err == nil {
+			res.conn, res.err = a.tryURL(ctx, u, init)
 		}
-		return ret, nil
+		select {
+		case ch <- res:
+		case <-ctx.Done():
+			if res.conn != nil {
+				res.conn.Close()
+			}
+		}
 	}
 
-	// Connecting over plain HTTP failed, assume it's an HTTP proxy
-	// being difficult and see if we can get through over HTTPS.
-	u.Scheme = "https"
-	u.Host = net.JoinHostPort(a.host, a.httpsPort)
-	init, cont, err = controlbase.ClientDeferred(a.machineKey, a.controlKey, a.version)
-	if err != nil {
-		return nil, err
-	}
-	conn, tlsErr := a.tryURL(u, init)
-	if tlsErr == nil {
-		ret, err := cont(a.ctx, conn)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-		return ret, nil
-	}
+	// Start the plaintext HTTP attempt first.
+	go try(u80)
 
-	return nil, fmt.Errorf("all connection attempts failed (HTTP: %v, HTTPS: %v)", httpErr, tlsErr)
+	// In case outbound port 80 blocked or MITM'ed poorly, start a backup timer
+	// to dial port 443 if port 80 doesn't either succeed or fail quickly.
+	try443Timer := time.AfterFunc(500*time.Millisecond, func() { try(u443) })
+	defer try443Timer.Stop()
+
+	var err80, err443 error
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("connection attempts aborted by context: %w", ctx.Err())
+		case res := <-ch:
+			if res.err == nil {
+				ret, err := res.cont(ctx, res.conn)
+				if err != nil {
+					res.conn.Close()
+					return nil, err
+				}
+				return ret, nil
+			}
+			switch res.u {
+			case u80:
+				// Connecting over plain HTTP failed; assume it's an HTTP proxy
+				// being difficult and see if we can get through over HTTPS.
+				err80 = res.err
+				// Stop the fallback timer and run it immediately. We don't use
+				// Timer.Reset(0) here because on AfterFuncs, that can run it
+				// again.
+				if try443Timer.Stop() {
+					go try(u443)
+				} // else we lost the race and it started already which is what we want
+			case u443:
+				err443 = res.err
+			default:
+				panic("invalid")
+			}
+			if err80 != nil && err443 != nil {
+				return nil, fmt.Errorf("all connection attempts failed (HTTP: %v, HTTPS: %v)", err80, err443)
+			}
+		}
+	}
 }
 
-func (a *dialParams) tryURL(u *url.URL, init []byte) (net.Conn, error) {
+// tryURL connects to u, and tries to upgrade it to a net.Conn.
+//
+// Only the provided ctx is used, not a.ctx.
+func (a *dialParams) tryURL(ctx context.Context, u *url.URL, init []byte) (net.Conn, error) {
 	dns := &dnscache.Resolver{
 		Forward:          dnscache.Get().Forward,
 		LookupIPFallback: dnsfallback.Lookup,
 		UseLastGood:      true,
 	}
-	dialer := netns.NewDialer(log.Printf)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	defer tr.CloseIdleConnections()
 	tr.Proxy = a.proxyFunc
 	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
-	tr.DialContext = dnscache.Dialer(dialer.DialContext, dns)
+	tr.DialContext = dnscache.Dialer(a.dialer, dns)
 	// Disable HTTP2, since h2 can't do protocol switching.
 	tr.TLSClientConfig.NextProtos = []string{}
 	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
@@ -159,7 +209,7 @@ func (a *dialParams) tryURL(u *url.URL, init []byte) (net.Conn, error) {
 		tr.TLSClientConfig.InsecureSkipVerify = true
 		tr.TLSClientConfig.VerifyConnection = nil
 	}
-	tr.DialTLSContext = dnscache.TLSDialer(dialer.DialContext, dns, tr.TLSClientConfig)
+	tr.DialTLSContext = dnscache.TLSDialer(a.dialer, dns, tr.TLSClientConfig)
 	tr.DisableCompression = true
 
 	// (mis)use httptrace to extract the underlying net.Conn from the
@@ -189,7 +239,7 @@ func (a *dialParams) tryURL(u *url.URL, init []byte) (net.Conn, error) {
 			connCh <- info.Conn
 		},
 	}
-	ctx := httptrace.WithClientTrace(a.ctx, &trace)
+	ctx = httptrace.WithClientTrace(ctx, &trace)
 	req := &http.Request{
 		Method: "POST",
 		URL:    u,
