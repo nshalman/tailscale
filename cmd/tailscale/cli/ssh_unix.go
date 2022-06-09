@@ -8,13 +8,13 @@
 package cli
 
 import (
-//	"bytes"
+	"bytes"
 	"os"
-//	"path/filepath"
+	"path/filepath"
 	"runtime"
-//	"strconv"
+	"strconv"
 
-//	"golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -29,8 +29,6 @@ func init() {
 			// darwin and bsd.
 			return ""
 		}
-	/* XXX FIXME GROSS HACK https://go-review.googlesource.com/c/sys/+/410370
-	 * THIS IS JUST FOR ILLUMOS BUILDS!!!
 		// SID is the session ID of the user's login session.
 		// It is also the process ID of the original shell that the user logged in with.
 		// We only need to check the environment of that process.
@@ -48,7 +46,6 @@ func init() {
 				return string(env[len(prefix):])
 			}
 		}
-	*/
 		return ""
 	}
 }
