@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'illumos-*'
   pull_request:
     branches:
       - '*'
@@ -25,11 +26,17 @@ jobs:
     - name: Check out code into the Go module directory
       uses: actions/checkout@v3
 
-    - name: illumos build cmd
+    - name: illumos build tailscale
       env:
         GOOS: illumos
         GOARCH: amd64
-      run: go build ./cmd/...
+      run: go build ./cmd/tailscale
+
+    - name: illumos build tailscaled
+      env:
+        GOOS: illumos
+        GOARCH: amd64
+      run: go build ./cmd/tailscaled
 
     - name: illumos build tests
       env:
