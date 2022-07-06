@@ -179,7 +179,6 @@ func TestMatchRule(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &conn{
-				now:  time.Unix(200, 0),
 				info: tt.ci,
 			}
 			got, gotUser, err := c.matchRule(tt.rule, nil)
@@ -238,9 +237,10 @@ func TestSSH(t *testing.T) {
 		node:    &tailcfg.Node{},
 		uprof:   &tailcfg.UserProfile{},
 	}
+	sc.finalAction = &tailcfg.SSHAction{Accept: true}
 
 	sc.Handler = func(s ssh.Session) {
-		sc.newSSHSession(s, &tailcfg.SSHAction{Accept: true}).run()
+		sc.newSSHSession(s).run()
 	}
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
