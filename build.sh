@@ -15,6 +15,8 @@ GO_LDFLAGS="\
 
 for cmd in ./cmd/tailscale ./cmd/tailscaled; do
 	go build -v -tags xversion -ldflags "$GO_LDFLAGS" "$cmd"
+	# On SmartOS use platform elfedit, not pkgsrc one
+	/usr/bin/elfedit -e "ehdr:ei_osabi ELFOSABI_SOLARIS" "$(basename $cmd)"
 done
 
 mkdir ${pkgver}
