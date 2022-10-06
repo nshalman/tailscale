@@ -64,7 +64,7 @@ func CheckIPForwarding(routes []netip.Prefix, state *interfaces.State) (warn, er
 		switch runtime.GOOS {
 		case "dragonfly", "freebsd", "netbsd", "openbsd":
 			return fmt.Errorf("Subnet routing and exit nodes only work with additional manual configuration on %v, and is not currently officially supported.", runtime.GOOS), nil
-		case "illumos":
+		case "illumos", "solaris":
 			_, err := ipForwardingEnabledIllumos(ipv4, "")
 			if err != nil {
 				return nil, fmt.Errorf("Couldn't check system's IP forwarding configuration, subnet routing/exit nodes may not work: %w%s", err, "")

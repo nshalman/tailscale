@@ -281,4 +281,6 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.0.0-20210415151418-c5206de65a78 // indirect
 )
 
-replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20220828133043-ea760390e58d
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20221006012343-87b346fe7b7e
+
+replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20221006010545-8b0bcf9e1b77

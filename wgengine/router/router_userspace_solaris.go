@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build illumos
-// +build illumos
+//go:build illumos || solaris
+// +build illumos solaris
 
 package router
 
@@ -19,7 +19,7 @@ import (
 	"tailscale.com/wgengine/monitor"
 )
 
-type userspaceIllumosRouter struct {
+type userspaceSunosRouter struct {
 	logf    logger.Logf
 	linkMon *monitor.Mon
 	tunname string
@@ -27,20 +27,20 @@ type userspaceIllumosRouter struct {
 	routes  map[netip.Prefix]struct{}
 }
 
-func newUserspaceIllumosRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceSunosRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
 	}
 
-	return &userspaceIllumosRouter{
+	return &userspaceSunosRouter{
 		logf:    logf,
 		linkMon: linkMon,
 		tunname: tunname,
 	}, nil
 }
 
-func (r *userspaceIllumosRouter) addrsToRemove(newLocalAddrs []netip.Prefix) (remove []netip.Prefix) {
+func (r *userspaceSunosRouter) addrsToRemove(newLocalAddrs []netip.Prefix) (remove []netip.Prefix) {
 	for _, cur := range r.local {
 		found := false
 		for _, v := range newLocalAddrs {
@@ -56,7 +56,7 @@ func (r *userspaceIllumosRouter) addrsToRemove(newLocalAddrs []netip.Prefix) (re
 	return
 }
 
-func (r *userspaceIllumosRouter) addrsToAdd(newLocalAddrs []netip.Prefix) (add []netip.Prefix) {
+func (r *userspaceSunosRouter) addrsToAdd(newLocalAddrs []netip.Prefix) (add []netip.Prefix) {
 	for _, cur := range newLocalAddrs {
 		found := false
 		for _, v := range r.local {
@@ -88,7 +88,7 @@ func cmdVerbose(logf logger.Logf, args []string) (string, error) {
 	return out, err
 }
 
-func (r *userspaceIllumosRouter) Up() error {
+func (r *userspaceSunosRouter) Up() error {
 	ifup := []string{"ifconfig", r.tunname, "up"}
 	if out, err := cmd(ifup...).CombinedOutput(); err != nil {
 		r.logf("running ifconfig failed: %v\n%s", err, out)
@@ -105,7 +105,7 @@ func inet(p netip.Prefix) string {
 	return "inet"
 }
 
-func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
+func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 	if cfg == nil {
 		cfg = &shutdownConfig
 	}
@@ -206,7 +206,7 @@ func (r *userspaceIllumosRouter) Set(cfg *Config) (reterr error) {
 	return errq
 }
 
-func (r *userspaceIllumosRouter) Close() error {
+func (r *userspaceSunosRouter) Close() error {
 	cleanup(r.logf, r.tunname)
 	return nil
 }
