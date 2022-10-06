@@ -28,7 +28,7 @@ shasum -a 256 * > sha256sums
 cat >index.html <<EOF
 <html>
 <head><title>${GOOS} build of Tailscale ${pkgver}</title></head>
-illumos build of Tailscale ${pkgver}
+${GOOS} build of Tailscale ${pkgver}
 <ul>
 <li><a href="tailscale">tailscale</a></li>
 <li><a href="tailscaled">tailscaled</a></li>
