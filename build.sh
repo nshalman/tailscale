@@ -7,16 +7,25 @@ pkgver=$(git describe --tags --dirty)
 _commit=$(git rev-parse HEAD)
 
 export GOOS=${1-illumos}
+
+# This prevents illumos libc from leaking into Solaris binaries when built on illumos
+export CGO_ENABLED=0
+
 GO_LDFLAGS="\
         -X tailscale.com/version.Long=${pkgver} \
         -X tailscale.com/version.Short=${pkgver} \
         -X tailscale.com/version.GitCommit=${_commit}"
 
-
 for cmd in ./cmd/tailscale ./cmd/tailscaled; do
 	go build -v -tags xversion -ldflags "$GO_LDFLAGS" "$cmd"
-	# On SmartOS use platform elfedit, not pkgsrc one
-	[[ ${GOOS} == illumos ]] && [[ $(uname -s) == SunOS ]] && /usr/bin/elfedit -e "ehdr:ei_osabi ELFOSABI_SOLARIS" "$(basename $cmd)"
+	if [[ $(uname -s) == SunOS ]]; then
+		/usr/bin/elfedit \
+			-e "ehdr:ei_osabi ELFOSABI_SOLARIS" \
+			-e "ehdr:ei_abiversion EAV_SUNW_CURRENT" \
+			"$(basename $cmd)"
+	else
+		elfedit --output-osabi "Solaris" --output-abiversion "1" "$(basename $cmd)"
+	fi
 done
 
 mkdir ${pkgver}
@@ -24,7 +33,7 @@ mv tailscale tailscaled ${pkgver}
 cp cmd/tailscaled/tailscale.xml ${pkgver}
 cp $0 ${pkgver}/build.sh
 cd ${pkgver}
-shasum -a 256 * > sha256sums
+shasum -a 256 * >sha256sums
 cat >index.html <<EOF
 <html>
 <head><title>${GOOS} build of Tailscale ${pkgver}</title></head>

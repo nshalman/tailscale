@@ -157,19 +157,19 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 	for _, route := range cfg.Routes {
 		newRoutes[route] = struct{}{}
 	}
-	// Delete any pre-existing routes. TODO(nshalman)
+	// Delete any pre-existing routes.
 	for route := range r.routes {
 		if _, keep := newRoutes[route]; !keep {
 			net := netipx.PrefixIPNet(route)
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits())
-			del := "del"
+			del := "delete"
 			routedel := []string{"route", "-q", "-n",
 				del, "-" + inet(route), nstr,
 				"-iface", r.tunname}
 			out, err := cmd(routedel...).CombinedOutput()
 			if err != nil {
-				r.logf("route del failed: %v: %v\n%s", routedel, err, out)
+				r.logf("route delete failed: %v: %v\n%s", routedel, err, out)
 				setErr(err)
 			}
 		}
