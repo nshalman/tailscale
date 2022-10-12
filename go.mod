@@ -288,3 +288,5 @@ require (
 	mvdan.cc/lint v0.0.0-20170908181259-adc824a0674b // indirect
 	mvdan.cc/unparam v0.0.0-20211002134041-24922b6997ca // indirect
 )
+
+replace golang.zx2c4.com/wireguard => github.com/nshalman/wireguard-go v0.0.20200321-0.20221012182213-c8619d9e5497
