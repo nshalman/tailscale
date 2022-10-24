@@ -198,6 +198,14 @@ type LocalBackend struct {
 	// dialPlan is any dial plan that we've received from the control
 	// server during a previous connection; it is cleared on logout.
 	dialPlan atomic.Pointer[tailcfg.ControlDialPlan]
+
+	// tkaSyncLock is used to make tkaSyncIfNeeded an exclusive
+	// section. This is needed to stop two map-responses in quick succession
+	// from racing each other through TKA sync logic / RPCs.
+	//
+	// tkaSyncLock MUST be taken before mu (or inversely, mu must not be held
+	// at the moment that tkaSyncLock is taken).
+	tkaSyncLock sync.Mutex
 }
 
 // clientGen is a func that creates a control plane client.
@@ -353,6 +361,21 @@ func (b *LocalBackend) SetComponentDebugLogging(component string, until time.Tim
 	}
 	mak.Set(&b.componentLogUntil, component, newSt)
 	return nil
+}
+
+// GetComponentDebugLogging gets the time that component's debug logging is
+// enabled until, or the zero time if component's time is not currently
+// enabled.
+func (b *LocalBackend) GetComponentDebugLogging(component string) time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	ls := b.componentLogUntil[component]
+	if ls.until.IsZero() || ls.until.Before(now) {
+		return time.Time{}
+	}
+	return ls.until
 }
 
 // Dialer returns the backend's dialer.
@@ -775,9 +798,12 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 		}
 	}
 	if st.NetMap != nil {
-		if err := b.tkaSyncIfNeededLocked(st.NetMap); err != nil {
+		b.mu.Unlock() // respect locking rules for tkaSyncIfNeeded
+		if err := b.tkaSyncIfNeeded(st.NetMap); err != nil {
 			b.logf("[v1] TKA sync error: %v", err)
 		}
+		b.mu.Lock()
+
 		if !envknob.TKASkipSignatureCheck() {
 			b.tkaFilterNetmapLocked(st.NetMap)
 		}
@@ -2321,7 +2347,7 @@ func (b *LocalBackend) doSetHostinfoFilterServices(hi *tailcfg.Hostinfo) {
 	}
 	peerAPIServices := b.peerAPIServicesLocked()
 	if b.egg {
-		peerAPIServices = append(peerAPIServices, tailcfg.Service{Proto: "egg"})
+		peerAPIServices = append(peerAPIServices, tailcfg.Service{Proto: "egg", Port: 1})
 	}
 	b.mu.Unlock()
 
