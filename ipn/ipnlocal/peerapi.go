@@ -32,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kortschak/wol"
+	"golang.org/x/exp/slices"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/health"
@@ -58,7 +59,6 @@ var addH2C func(*http.Server)
 type peerAPIServer struct {
 	b          *LocalBackend
 	rootDir    string // empty means file receiving unavailable
-	selfNode   *tailcfg.Node
 	knownEmpty atomic.Bool
 	resolver   *resolver.Resolver
 
@@ -512,10 +512,17 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		c.Close()
 		return
 	}
+	nm := pln.lb.NetMap()
+	if nm == nil || nm.SelfNode == nil {
+		logf("peerapi: no netmap")
+		c.Close()
+		return
+	}
 	h := &peerAPIHandler{
 		ps:         pln.ps,
-		isSelf:     pln.ps.selfNode.User == peerNode.User,
+		isSelf:     nm.SelfNode.User == peerNode.User,
 		remoteAddr: src,
+		selfNode:   nm.SelfNode,
 		peerNode:   peerNode,
 		peerUser:   peerUser,
 	}
@@ -533,6 +540,7 @@ type peerAPIHandler struct {
 	ps         *peerAPIServer
 	remoteAddr netip.AddrPort
 	isSelf     bool                // whether peerNode is owned by same user as this node
+	selfNode   *tailcfg.Node       // this node; always non-nil
 	peerNode   *tailcfg.Node       // peerNode is who's making the request
 	peerUser   tailcfg.UserProfile // profile of peerNode
 }
@@ -541,7 +549,37 @@ func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
 }
 
+func (h *peerAPIHandler) validateHost(r *http.Request) error {
+	if r.Host == "peer" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(r.Host)
+	if err != nil {
+		return err
+	}
+	hostIPPfx := netip.PrefixFrom(ap.Addr(), ap.Addr().BitLen())
+	if !slices.Contains(h.selfNode.Addresses, hostIPPfx) {
+		return fmt.Errorf("%v not found in self addresses", hostIPPfx)
+	}
+	return nil
+}
+
+func (h *peerAPIHandler) validatePeerAPIRequest(r *http.Request) error {
+	if r.Referer() != "" {
+		return errors.New("unexpected Referer")
+	}
+	if r.Header.Get("Origin") != "" {
+		return errors.New("unexpected Origin")
+	}
+	return h.validateHost(r)
+}
+
 func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := h.validatePeerAPIRequest(r); err != nil {
+		h.logf("invalid request from %v: %v", h.remoteAddr, err)
+		http.Error(w, "invalid peerapi request", http.StatusForbidden)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v0/put/") {
 		h.handlePeerPut(w, r)
 		return
@@ -686,6 +724,10 @@ func (h *peerAPIHandler) canPutFile() bool {
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
+	if !slices.Contains(h.selfNode.Capabilities, tailcfg.CapabilityDebug) {
+		// This node does not expose debug info.
+		return false
+	}
 	return h.isSelf || h.peerHasCap(tailcfg.CapabilityDebugPeer)
 }
 

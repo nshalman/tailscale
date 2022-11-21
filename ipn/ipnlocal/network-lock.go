@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
@@ -89,7 +90,7 @@ func (b *LocalBackend) tkaFilterNetmapLocked(nm *netmap.NetworkMap) {
 //
 // tkaSyncIfNeeded immediately takes b.takeSyncLock which is held throughout,
 // and may take b.mu as required.
-func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap) error {
+func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap, prefs ipn.PrefsView) error {
 	if !envknob.UseWIPCode() {
 		// If the feature flag is not enabled, pretend we don't exist.
 		return nil
@@ -100,7 +101,7 @@ func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap) error {
 	b.mu.Lock() // take mu to protect access to synchronized fields.
 	defer b.mu.Unlock()
 
-	ourNodeKey := b.prefs.Persist.PrivateNodeKey.Public()
+	ourNodeKey := prefs.Persist().PublicNodeKey()
 
 	isEnabled := b.tka != nil
 	wantEnabled := nm.TKAEnabled
@@ -341,8 +342,8 @@ func (b *LocalBackend) NetworkLockInit(keys []tka.Key) error {
 
 	var ourNodeKey key.NodePublic
 	b.mu.Lock()
-	if b.prefs != nil {
-		ourNodeKey = b.prefs.Persist.PrivateNodeKey.Public()
+	if b.prefs.Valid() {
+		ourNodeKey = b.prefs.Persist().PublicNodeKey()
 	}
 	b.mu.Unlock()
 	if ourNodeKey.IsZero() {
@@ -453,7 +454,7 @@ func (b *LocalBackend) NetworkLockModify(addKeys, removeKeys []tka.Key) (err err
 		return nil
 	}
 
-	ourNodeKey := b.prefs.Persist.PrivateNodeKey.Public()
+	ourNodeKey := b.prefs.Persist().PublicNodeKey()
 	b.mu.Unlock()
 	resp, err := b.tkaDoSyncSend(ourNodeKey, aums, true)
 	b.mu.Lock()

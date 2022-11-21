@@ -122,15 +122,15 @@ func TestTKAEnablementFlow(t *testing.T) {
 		cc:      cc,
 		ccAuto:  cc,
 		logf:    t.Logf,
-		prefs: &ipn.Prefs{
+		prefs: (&ipn.Prefs{
 			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		},
+		}).View(),
 	}
 
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: true,
 		TKAHead:    a1.Head(),
-	})
+	}, b.prefs)
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -219,9 +219,9 @@ func TestTKADisablementFlow(t *testing.T) {
 			authority: authority,
 			storage:   chonk,
 		},
-		prefs: &ipn.Prefs{
+		prefs: (&ipn.Prefs{
 			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		},
+		}).View(),
 	}
 
 	// Test that the wrong disablement secret does not shut down the authority.
@@ -229,7 +229,7 @@ func TestTKADisablementFlow(t *testing.T) {
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: false,
 		TKAHead:    authority.Head(),
-	})
+	}, b.prefs)
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestTKADisablementFlow(t *testing.T) {
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 		TKAEnabled: false,
 		TKAHead:    authority.Head(),
-	})
+	}, b.prefs)
 	if err != nil {
 		t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 	}
@@ -456,16 +456,16 @@ func TestTKASync(t *testing.T) {
 					authority: nodeAuthority,
 					storage:   nodeStorage,
 				},
-				prefs: &ipn.Prefs{
+				prefs: (&ipn.Prefs{
 					Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-				},
+				}).View(),
 			}
 
 			// Finally, lets trigger a sync.
 			err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
 				TKAEnabled: true,
 				TKAHead:    controlAuthority.Head(),
-			})
+			}, b.prefs)
 			if err != nil {
 				t.Errorf("tkaSyncIfNeededLocked() failed: %v", err)
 			}
