@@ -33,6 +33,7 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
 )
 
 func TestContainerBoot(t *testing.T) {
@@ -97,31 +98,45 @@ func TestContainerBoot(t *testing.T) {
 	// step. Right now all of containerboot's modes either converge
 	// with no further interaction needed, or with one extra step
 	// only.
-	tests := []struct {
-		Name           string
-		Env            map[string]string
-		KubeSecret     map[string]string
-		WantArgs1      []string        // Wait for containerboot to run these commands...
-		Status1        ipnstate.Status // ... then report this status in LocalAPI.
-		WantArgs2      []string        // If non-nil, wait for containerboot to run these additional commands...
-		Status2        ipnstate.Status // ... then report this status in LocalAPI.
+	type phase struct {
+		// Make LocalAPI report this status, then wait for the Wants below to be
+		// satisfied. A zero Status is a valid state for a just-started
+		// tailscaled.
+		Status ipnstate.Status
+
+		// WantCmds is the commands that containerboot should run in this phase.
+		WantCmds []string
+		// WantKubeSecret is the secret keys/values that should exist in the
+		// kube secret.
 		WantKubeSecret map[string]string
-		WantFiles      map[string]string
+		// WantFiles files that should exist in the container and their
+		// contents.
+		WantFiles map[string]string
+	}
+	tests := []struct {
+		Name          string
+		Env           map[string]string
+		KubeSecret    map[string]string
+		KubeDenyPatch bool
+		Phases        []phase
 	}{
 		{
 			// Out of the box default: runs in userspace mode, ephemeral storage, interactive login.
 			Name: "no_args",
 			Env:  nil,
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
-			},
-			// The tailscale up call blocks until auth is complete, so
-			// by the time it returns the next converged state is
-			// Running.
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -130,13 +145,19 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"TS_AUTH_KEY": "tskey-key",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -145,13 +166,19 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTH_KEY":  "tskey-key",
 				"TS_STATE_DIR": filepath.Join(d, "tmp"),
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -160,17 +187,23 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTH_KEY": "tskey-key",
 				"TS_ROUTES":   "1.2.3.0/24,10.20.30.0/24",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=1.2.3.0/24,10.20.30.0/24",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-			},
-			WantFiles: map[string]string{
-				"proc/sys/net/ipv4/ip_forward":          "0",
-				"proc/sys/net/ipv6/conf/all/forwarding": "0",
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=1.2.3.0/24,10.20.30.0/24",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "0",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
 			},
 		},
 		{
@@ -180,17 +213,23 @@ func TestContainerBoot(t *testing.T) {
 				"TS_ROUTES":    "1.2.3.0/24,10.20.30.0/24",
 				"TS_USERSPACE": "false",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=1.2.3.0/24,10.20.30.0/24",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-			},
-			WantFiles: map[string]string{
-				"proc/sys/net/ipv4/ip_forward":          "1",
-				"proc/sys/net/ipv6/conf/all/forwarding": "0",
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=1.2.3.0/24,10.20.30.0/24",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
 			},
 		},
 		{
@@ -200,17 +239,23 @@ func TestContainerBoot(t *testing.T) {
 				"TS_ROUTES":    "::/64,1::/64",
 				"TS_USERSPACE": "false",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=::/64,1::/64",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-			},
-			WantFiles: map[string]string{
-				"proc/sys/net/ipv4/ip_forward":          "0",
-				"proc/sys/net/ipv6/conf/all/forwarding": "1",
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=::/64,1::/64",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "0",
+						"proc/sys/net/ipv6/conf/all/forwarding": "1",
+					},
+				},
 			},
 		},
 		{
@@ -220,17 +265,23 @@ func TestContainerBoot(t *testing.T) {
 				"TS_ROUTES":    "::/64,1.2.3.0/24",
 				"TS_USERSPACE": "false",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=::/64,1.2.3.0/24",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-			},
-			WantFiles: map[string]string{
-				"proc/sys/net/ipv4/ip_forward":          "1",
-				"proc/sys/net/ipv6/conf/all/forwarding": "1",
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key --advertise-routes=::/64,1.2.3.0/24",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "1",
+					},
+				},
 			},
 		},
 		{
@@ -240,20 +291,22 @@ func TestContainerBoot(t *testing.T) {
 				"TS_DEST_IP":   "1.2.3.4",
 				"TS_USERSPACE": "false",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-			},
-			WantArgs2: []string{
-				"/usr/bin/iptables -t nat -I PREROUTING 1 -d 100.64.0.1 -j DNAT --to-destination 1.2.3.4",
-			},
-			Status2: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+					WantCmds: []string{
+						"/usr/bin/iptables -t nat -I PREROUTING 1 -d 100.64.0.1 -j DNAT --to-destination 1.2.3.4",
+					},
+				},
 			},
 		},
 		{
@@ -262,18 +315,26 @@ func TestContainerBoot(t *testing.T) {
 				"TS_AUTH_KEY":  "tskey-key",
 				"TS_AUTH_ONCE": "true",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "NeedsLogin",
-			},
-			WantArgs2: []string{
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status2: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "NeedsLogin",
+					},
+					WantCmds: []string{
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -285,20 +346,58 @@ func TestContainerBoot(t *testing.T) {
 			KubeSecret: map[string]string{
 				"authkey": "tskey-key",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-				Self: &ipnstate.PeerStatus{
-					ID: tailcfg.StableNodeID("myID"),
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantKubeSecret: map[string]string{
+						"authkey": "tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+						Self: &ipnstate.PeerStatus{
+							ID: tailcfg.StableNodeID("myID"),
+						},
+					},
+					WantKubeSecret: map[string]string{
+						"authkey":   "tskey-key",
+						"device_id": "myID",
+					},
 				},
 			},
-			WantKubeSecret: map[string]string{
-				"authkey":   "tskey-key",
-				"device_id": "myID",
+		},
+		{
+			Name: "kube_storage_no_patch",
+			Env: map[string]string{
+				"KUBERNETES_SERVICE_HOST":       kube.Host,
+				"KUBERNETES_SERVICE_PORT_HTTPS": kube.Port,
+				"TS_AUTH_KEY":                   "tskey-key",
+			},
+			KubeSecret:    map[string]string{},
+			KubeDenyPatch: true,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantKubeSecret: map[string]string{},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+						Self: &ipnstate.PeerStatus{
+							ID: tailcfg.StableNodeID("myID"),
+						},
+					},
+					WantKubeSecret: map[string]string{},
+				},
 			},
 		},
 		{
@@ -312,24 +411,38 @@ func TestContainerBoot(t *testing.T) {
 			KubeSecret: map[string]string{
 				"authkey": "tskey-key",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "NeedsLogin",
-			},
-			WantArgs2: []string{
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
-			},
-			Status2: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
-				Self: &ipnstate.PeerStatus{
-					ID: tailcfg.StableNodeID("myID"),
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=kube:tailscale --statedir=/tmp --tun=userspace-networking",
+					},
+					WantKubeSecret: map[string]string{
+						"authkey": "tskey-key",
+					},
 				},
-			},
-			WantKubeSecret: map[string]string{
-				"device_id": "myID",
+				{
+					Status: ipnstate.Status{
+						BackendState: "NeedsLogin",
+					},
+					WantCmds: []string{
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantKubeSecret: map[string]string{
+						"authkey": "tskey-key",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+						Self: &ipnstate.PeerStatus{
+							ID: tailcfg.StableNodeID("myID"),
+						},
+					},
+					WantKubeSecret: map[string]string{
+						"device_id": "myID",
+					},
+				},
 			},
 		},
 		{
@@ -338,16 +451,22 @@ func TestContainerBoot(t *testing.T) {
 				"TS_SOCKS5_SERVER":              "localhost:1080",
 				"TS_OUTBOUND_HTTP_PROXY_LISTEN": "localhost:8080",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --socks5-server=localhost:1080 --outbound-http-proxy-listen=localhost:8080",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
-			},
-			// The tailscale up call blocks until auth is complete, so
-			// by the time it returns the next converged state is
-			// Running.
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --socks5-server=localhost:1080 --outbound-http-proxy-listen=localhost:8080",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+				},
+				{
+					// The tailscale up call blocks until auth is complete, so
+					// by the time it returns the next converged state is
+					// Running.
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -355,13 +474,19 @@ func TestContainerBoot(t *testing.T) {
 			Env: map[string]string{
 				"TS_ACCEPT_DNS": "true",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=true",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=true",
+					},
+				},
+				{
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 		{
@@ -370,13 +495,18 @@ func TestContainerBoot(t *testing.T) {
 				"TS_EXTRA_ARGS":            "--widget=rotated",
 				"TS_TAILSCALED_EXTRA_ARGS": "--experiments=widgets",
 			},
-			WantArgs1: []string{
-				"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --experiments=widgets",
-				"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --widget=rotated",
-			},
-			Status1: ipnstate.Status{
-				BackendState: "Running",
-				TailscaleIPs: tsIPs,
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --experiments=widgets",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --widget=rotated",
+					},
+				}, {
+					Status: ipnstate.Status{
+						BackendState: "Running",
+						TailscaleIPs: tsIPs,
+					},
+				},
 			},
 		},
 	}
@@ -392,6 +522,7 @@ func TestContainerBoot(t *testing.T) {
 			for k, v := range test.KubeSecret {
 				kube.SetSecret(k, v)
 			}
+			kube.SetPatching(!test.KubeDenyPatch)
 
 			cmd := exec.Command(boot)
 			cmd.Env = []string{
@@ -419,35 +550,45 @@ func TestContainerBoot(t *testing.T) {
 				cmd.Process.Wait()
 			}()
 
-			waitArgs(t, 2*time.Second, d, argFile, strings.Join(test.WantArgs1, "\n"))
-			lapi.SetStatus(test.Status1)
-			if test.WantArgs2 != nil {
-				waitArgs(t, 2*time.Second, d, argFile, strings.Join(append(test.WantArgs1, test.WantArgs2...), "\n"))
-				lapi.SetStatus(test.Status2)
+			var wantCmds []string
+			for _, p := range test.Phases {
+				lapi.SetStatus(p.Status)
+				wantCmds = append(wantCmds, p.WantCmds...)
+				waitArgs(t, 2*time.Second, d, argFile, strings.Join(wantCmds, "\n"))
+				err := tstest.WaitFor(2*time.Second, func() error {
+					if p.WantKubeSecret != nil {
+						got := kube.Secret()
+						if diff := cmp.Diff(got, p.WantKubeSecret); diff != "" {
+							return fmt.Errorf("unexpected kube secret data (-got+want):\n%s", diff)
+						}
+					} else {
+						got := kube.Secret()
+						if len(got) > 0 {
+							return fmt.Errorf("kube secret unexpectedly not empty, got %#v", got)
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = tstest.WaitFor(2*time.Second, func() error {
+					for path, want := range p.WantFiles {
+						gotBs, err := os.ReadFile(filepath.Join(d, path))
+						if err != nil {
+							return fmt.Errorf("reading wanted file %q: %v", path, err)
+						}
+						if got := strings.TrimSpace(string(gotBs)); got != want {
+							return fmt.Errorf("wrong file contents for %q, got %q want %q", path, got, want)
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			waitLogLine(t, 2*time.Second, cbOut, "Startup complete, waiting for shutdown signal")
-
-			if test.WantKubeSecret != nil {
-				got := kube.Secret()
-				if diff := cmp.Diff(got, test.WantKubeSecret); diff != "" {
-					t.Fatalf("unexpected kube secret data (-got+want):\n%s", diff)
-				}
-			} else {
-				got := kube.Secret()
-				if len(got) != 0 {
-					t.Fatalf("kube secret unexpectedly not empty, got %#v", got)
-				}
-			}
-
-			for path, want := range test.WantFiles {
-				gotBs, err := os.ReadFile(filepath.Join(d, path))
-				if err != nil {
-					t.Fatalf("reading wanted file %q: %v", path, err)
-				}
-				if got := strings.TrimSpace(string(gotBs)); got != want {
-					t.Errorf("wrong file contents for %q, got %q want %q", path, got, want)
-				}
-			}
 		})
 	}
 }
@@ -612,7 +753,8 @@ type kubeServer struct {
 	srv *httptest.Server
 
 	sync.Mutex
-	secret map[string]string
+	secret   map[string]string
+	canPatch bool
 }
 
 func (k *kubeServer) Secret() map[string]string {
@@ -629,6 +771,12 @@ func (k *kubeServer) SetSecret(key, val string) {
 	k.Lock()
 	defer k.Unlock()
 	k.secret[key] = val
+}
+
+func (k *kubeServer) SetPatching(canPatch bool) {
+	k.Lock()
+	defer k.Unlock()
+	k.canPatch = canPatch
 }
 
 func (k *kubeServer) Reset() {
@@ -674,10 +822,39 @@ func (k *kubeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Authorization") != "Bearer bearer_token" {
 		panic("client didn't provide bearer token in request")
 	}
-	if r.URL.Path != "/api/v1/namespaces/default/secrets/tailscale" {
+	switch r.URL.Path {
+	case "/api/v1/namespaces/default/secrets/tailscale":
+		k.serveSecret(w, r)
+	case "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews":
+		k.serveSSAR(w, r)
+	default:
 		panic(fmt.Sprintf("unhandled fake kube api path %q", r.URL.Path))
 	}
+}
 
+func (k *kubeServer) serveSSAR(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Spec struct {
+			ResourceAttributes struct {
+				Verb string `json:"verb"`
+			} `json:"resourceAttributes"`
+		} `json:"spec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		panic(fmt.Sprintf("decoding SSAR request: %v", err))
+	}
+	ok := true
+	if req.Spec.ResourceAttributes.Verb == "patch" {
+		k.Lock()
+		defer k.Unlock()
+		ok = k.canPatch
+	}
+	// Just say yes to all SARs, we don't enforce RBAC.
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":{"allowed":%v}}`, ok)
+}
+
+func (k *kubeServer) serveSecret(w http.ResponseWriter, r *http.Request) {
 	bs, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("reading request body: %v", err), http.StatusInternalServerError)
@@ -688,7 +865,7 @@ func (k *kubeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET":
 		w.Header().Set("Content-Type", "application/json")
 		ret := map[string]map[string]string{
-			"data": map[string]string{},
+			"data": {},
 		}
 		k.Lock()
 		defer k.Unlock()
@@ -703,6 +880,11 @@ func (k *kubeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			panic("encode failed")
 		}
 	case "PATCH":
+		k.Lock()
+		defer k.Unlock()
+		if !k.canPatch {
+			panic("containerboot tried to patch despite not being allowed")
+		}
 		switch r.Header.Get("Content-Type") {
 		case "application/json-patch+json":
 			req := []struct {
@@ -712,8 +894,6 @@ func (k *kubeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal(bs, &req); err != nil {
 				panic(fmt.Sprintf("json decode failed: %v. Body:\n\n%s", err, string(bs)))
 			}
-			k.Lock()
-			defer k.Unlock()
 			for _, op := range req {
 				if op.Op != "remove" {
 					panic(fmt.Sprintf("unsupported json-patch op %q", op.Op))
@@ -730,8 +910,6 @@ func (k *kubeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal(bs, &req); err != nil {
 				panic(fmt.Sprintf("json decode failed: %v. Body:\n\n%s", err, string(bs)))
 			}
-			k.Lock()
-			defer k.Unlock()
 			for key, val := range req.Data {
 				k.secret[key] = val
 			}

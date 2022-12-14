@@ -116,22 +116,45 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if cfg.InKubernetes && cfg.KubeSecret != "" && cfg.AuthKey == "" {
-		key, err := findKeyInKubeSecret(ctx, cfg.KubeSecret)
+	if cfg.InKubernetes && cfg.KubeSecret != "" {
+		canPatch, err := checkSecretPermissions(ctx, cfg.KubeSecret)
 		if err != nil {
-			log.Fatalf("Getting authkey from kube secret: %v", err)
+			log.Fatalf("Some Kubernetes permissions are missing, please check your RBAC configuration: %v", err)
 		}
-		if key != "" {
-			log.Print("Using authkey found in kube secret")
-			cfg.AuthKey = key
-		} else {
-			log.Print("No authkey found in kube secret and TS_AUTHKEY not provided, login will be interactive if needed.")
+		cfg.KubernetesCanPatch = canPatch
+
+		if cfg.AuthKey == "" {
+			key, err := findKeyInKubeSecret(ctx, cfg.KubeSecret)
+			if err != nil {
+				log.Fatalf("Getting authkey from kube secret: %v", err)
+			}
+			if key != "" {
+				// This behavior of pulling authkeys from kube secrets was added
+				// at the same time as the patch permission, so we can enforce
+				// that we must be able to patch out the authkey after
+				// authenticating if you want to use this feature. This avoids
+				// us having to deal with the case where we might leave behind
+				// an unnecessary reusable authkey in a secret, like a rake in
+				// the grass.
+				if !cfg.KubernetesCanPatch {
+					log.Fatalf("authkey found in TS_KUBE_SECRET, but the pod doesn't have patch permissions on the secret to manage the authkey.")
+				}
+				log.Print("Using authkey found in kube secret")
+				cfg.AuthKey = key
+			} else {
+				log.Print("No authkey found in kube secret and TS_AUTHKEY not provided, login will be interactive if needed.")
+			}
 		}
 	}
 
-	st, daemonPid, err := startAndAuthTailscaled(ctx, cfg)
+	client, daemonPid, err := startTailscaled(ctx, cfg)
 	if err != nil {
 		log.Fatalf("failed to bring up tailscale: %v", err)
+	}
+
+	st, err := authTailscaled(ctx, client, cfg)
+	if err != nil {
+		log.Fatalf("failed to auth tailscale: %v", err)
 	}
 
 	if cfg.ProxyTo != "" {
@@ -139,7 +162,7 @@ func main() {
 			log.Fatalf("installing proxy rules: %v", err)
 		}
 	}
-	if cfg.InKubernetes && cfg.KubeSecret != "" {
+	if cfg.InKubernetes && cfg.KubernetesCanPatch && cfg.KubeSecret != "" {
 		if err := storeDeviceID(ctx, cfg.KubeSecret, string(st.Self.ID)); err != nil {
 			log.Fatalf("storing device ID in kube secret: %v", err)
 		}
@@ -173,10 +196,7 @@ func main() {
 	}
 }
 
-// startAndAuthTailscaled starts the tailscale daemon and attempts to
-// auth it, according to the settings in cfg. If successful, returns
-// tailscaled's Status and pid.
-func startAndAuthTailscaled(ctx context.Context, cfg *settings) (*ipnstate.Status, int, error) {
+func startTailscaled(ctx context.Context, cfg *settings) (*tailscale.LocalClient, int, error) {
 	args := tailscaledArgs(cfg)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, unix.SIGTERM, unix.SIGINT)
@@ -198,8 +218,7 @@ func startAndAuthTailscaled(ctx context.Context, cfg *settings) (*ipnstate.Statu
 		cmd.Process.Signal(unix.SIGTERM)
 	}()
 
-	// Wait for the socket file to appear, otherwise 'tailscale up'
-	// can fail.
+	// Wait for the socket file to appear, otherwise API ops will racily fail.
 	log.Printf("Waiting for tailscaled socket")
 	for {
 		if ctx.Err() != nil {
@@ -215,17 +234,24 @@ func startAndAuthTailscaled(ctx context.Context, cfg *settings) (*ipnstate.Statu
 		break
 	}
 
+	tsClient := &tailscale.LocalClient{
+		Socket:        cfg.Socket,
+		UseSocketOnly: true,
+	}
+
+	return tsClient, cmd.Process.Pid, nil
+}
+
+// startAndAuthTailscaled starts the tailscale daemon and attempts to
+// auth it, according to the settings in cfg. If successful, returns
+// tailscaled's Status and pid.
+func authTailscaled(ctx context.Context, client *tailscale.LocalClient, cfg *settings) (*ipnstate.Status, error) {
 	didLogin := false
 	if !cfg.AuthOnce {
 		if err := tailscaleUp(ctx, cfg); err != nil {
-			return nil, 0, fmt.Errorf("couldn't log in: %v", err)
+			return nil, fmt.Errorf("couldn't log in: %v", err)
 		}
 		didLogin = true
-	}
-
-	tsClient := tailscale.LocalClient{
-		Socket:        cfg.Socket,
-		UseSocketOnly: true,
 	}
 
 	// Poll for daemon state until it goes to either Running or
@@ -234,20 +260,20 @@ func startAndAuthTailscaled(ctx context.Context, cfg *settings) (*ipnstate.Statu
 	// reach the running state.
 	for {
 		if ctx.Err() != nil {
-			return nil, 0, ctx.Err()
+			return nil, ctx.Err()
 		}
 
 		loopCtx, cancel := context.WithTimeout(ctx, time.Second)
-		st, err := tsClient.Status(loopCtx)
+		st, err := client.Status(loopCtx)
 		cancel()
 		if err != nil {
-			return nil, 0, fmt.Errorf("Getting tailscaled state: %w", err)
+			return nil, fmt.Errorf("Getting tailscaled state: %w", err)
 		}
 
 		switch st.BackendState {
 		case "Running":
 			if len(st.TailscaleIPs) > 0 {
-				return st, cmd.Process.Pid, nil
+				return st, nil
 			}
 			log.Printf("No Tailscale IPs assigned yet")
 		case "NeedsLogin":
@@ -256,7 +282,7 @@ func startAndAuthTailscaled(ctx context.Context, cfg *settings) (*ipnstate.Statu
 				// LocalAPI, so we still have to shell out to the
 				// tailscale CLI for this bit.
 				if err := tailscaleUp(ctx, cfg); err != nil {
-					return nil, 0, fmt.Errorf("couldn't log in: %v", err)
+					return nil, fmt.Errorf("couldn't log in: %v", err)
 				}
 				didLogin = true
 			}
@@ -275,7 +301,7 @@ func tailscaledArgs(cfg *settings) []string {
 	case cfg.InKubernetes && cfg.KubeSecret != "":
 		args = append(args, "--state=kube:"+cfg.KubeSecret, "--statedir=/tmp")
 	case cfg.StateDir != "":
-		args = append(args, "--state="+cfg.StateDir)
+		args = append(args, "--statedir="+cfg.StateDir)
 	default:
 		args = append(args, "--state=mem:", "--statedir=/tmp")
 	}
@@ -433,21 +459,22 @@ func installIPTablesRule(ctx context.Context, dstStr string, tsIPs []netip.Addr)
 
 // settings is all the configuration for containerboot.
 type settings struct {
-	AuthKey         string
-	Routes          string
-	ProxyTo         string
-	DaemonExtraArgs string
-	ExtraArgs       string
-	InKubernetes    bool
-	UserspaceMode   bool
-	StateDir        string
-	AcceptDNS       bool
-	KubeSecret      string
-	SOCKSProxyAddr  string
-	HTTPProxyAddr   string
-	Socket          string
-	AuthOnce        bool
-	Root            string
+	AuthKey            string
+	Routes             string
+	ProxyTo            string
+	DaemonExtraArgs    string
+	ExtraArgs          string
+	InKubernetes       bool
+	UserspaceMode      bool
+	StateDir           string
+	AcceptDNS          bool
+	KubeSecret         string
+	SOCKSProxyAddr     string
+	HTTPProxyAddr      string
+	Socket             string
+	AuthOnce           bool
+	Root               string
+	KubernetesCanPatch bool
 }
 
 // defaultEnv returns the value of the given envvar name, or defVal if

@@ -21,7 +21,83 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"tailscale.com/util/multierr"
 )
+
+// checkSecretPermissions checks the secret access permissions of the current
+// pod. It returns an error if the basic permissions tailscale needs are
+// missing, and reports whether the patch permission is additionally present.
+//
+// Errors encountered during the access checking process are logged, but ignored
+// so that the pod tries to fail alive if the permissions exist and there's just
+// something wrong with SelfSubjectAccessReviews. There shouldn't be, pods
+// should always be able to use SSARs to assess their own permissions, but since
+// we didn't use to check permissions this way we'll be cautious in case some
+// old version of k8s deviates from the current behavior.
+func checkSecretPermissions(ctx context.Context, secretName string) (canPatch bool, err error) {
+	var errs []error
+	for _, verb := range []string{"get", "update"} {
+		ok, err := checkPermission(ctx, verb, secretName)
+		if err != nil {
+			log.Printf("error checking %s permission on secret %s: %v", verb, secretName, err)
+		} else if !ok {
+			errs = append(errs, fmt.Errorf("missing %s permission on secret %q", verb, secretName))
+		}
+	}
+	if len(errs) > 0 {
+		return false, multierr.New(errs...)
+	}
+	ok, err := checkPermission(ctx, "patch", secretName)
+	if err != nil {
+		log.Printf("error checking patch permission on secret %s: %v", secretName, err)
+		return false, nil
+	}
+	return ok, nil
+}
+
+// checkPermission reports whether the current pod has permission to use the
+// given verb (e.g. get, update, patch) on secretName.
+func checkPermission(ctx context.Context, verb, secretName string) (bool, error) {
+	sar := map[string]any{
+		"apiVersion": "authorization.k8s.io/v1",
+		"kind":       "SelfSubjectAccessReview",
+		"spec": map[string]any{
+			"resourceAttributes": map[string]any{
+				"namespace": kubeNamespace,
+				"verb":      verb,
+				"resource":  "secrets",
+				"name":      secretName,
+			},
+		},
+	}
+	bs, err := json.Marshal(sar)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequest("POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", bytes.NewReader(bs))
+	if err != nil {
+		return false, err
+	}
+	resp, err := doKubeRequest(ctx, req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	bs, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		Status struct {
+			Allowed bool `json:"allowed"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(bs, &res); err != nil {
+		return false, err
+	}
+	return res.Status.Allowed, nil
+}
 
 // findKeyInKubeSecret inspects the kube secret secretName for a data
 // field called "authkey", and returns its value if present.
@@ -84,7 +160,7 @@ func storeDeviceID(ctx context.Context, secretName, deviceID string) error {
 	}
 
 	m := map[string]map[string]string{
-		"stringData": map[string]string{
+		"stringData": {
 			"device_id": deviceID,
 		},
 	}
@@ -193,8 +269,8 @@ func doKubeRequest(ctx context.Context, r *http.Request) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return resp, fmt.Errorf("got non-200 status code %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return resp, fmt.Errorf("got non-200/201 status code %d", resp.StatusCode)
 	}
 	return resp, nil
 }
