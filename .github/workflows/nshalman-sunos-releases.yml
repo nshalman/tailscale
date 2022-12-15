@@ -8,25 +8,27 @@ on:
 
 jobs:
   tagged-release:
-    name: "Tagged Release"
+    name: "SunOS Tagged Release"
     runs-on: "ubuntu-latest"
 
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: 1.19
-        id: go
-  
-      - name: Check out code into the Go module directory
+      - name: Check out code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+        id: go
   
-      - name: sunos build script
+      - name: SunOS build script
         run: bash -x build.sh
 
-      - uses: "marvinpinto/action-automatic-releases@latest"
+      - name: Create Release
+        uses: "marvinpinto/action-automatic-releases@latest"
         with:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           prerelease: false
