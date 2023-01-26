@@ -1,0 +1,35 @@
+name: illumos-Cross
+
+on:
+  push:
+    branches:
+      - main
+      - 'illumos-*'
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+
+    steps:
+
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: 1.19
+      id: go
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: illumos build script
+      env:
+        GOOS: illumos
+        GOARCH: amd64
+      run: bash -x build.sh
