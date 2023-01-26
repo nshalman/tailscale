@@ -924,8 +924,8 @@ github.com/nishanths/exhaustive v0.7.11/go.mod h1:gX+MP7DWMKJmNa1HfMozK+u04hQd3n
 github.com/nishanths/predeclared v0.0.0-20190419143655-18a43bb90ffc/go.mod h1:62PewwiQTlm/7Rj+cxVYqZvDIUc+JjZq6GHAC1fsObQ=
 github.com/nishanths/predeclared v0.2.1 h1:1TXtjmy4f3YCFjTxRd8zcFHOmoUir+gp0ESzjFzG2sw=
 github.com/nishanths/predeclared v0.2.1/go.mod h1:HvkGJcA3naj4lOwnFXFDkFxVtSqQMB9sbB1usJ+xjQE=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20221012182213-c8619d9e5497 h1:PHgWaaWGosonD+Cs9/N0Rvh4sNKb5uu5uaz9O3rANt4=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20221012182213-c8619d9e5497/go.mod h1:Itj/inI8hQnvRzRPtAs89mDpUfxZ3bMwo0qJwQ+CC4w=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20230126012956-0d59a42bb75d h1:mTv8mHyvOxbniJfTeQH7DnMvlyMDQgj1IsrrD/Gq7js=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20230126012956-0d59a42bb75d/go.mod h1:iiClgxBTruKI+nmzlQxbFw6c3nB/wb4Td/WCyX2berY=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/nxadm/tail v1.4.8 h1:nPr65rt6Y5JFSKQO7qToXr7pePgD6Gwiw05lkbyAQTE=
 github.com/nxadm/tail v1.4.8/go.mod h1:+ncqLTQzXmGhMZNUePPaPqPvBxHAIsmXswZKocGu+AU=
@@ -1172,8 +1172,6 @@ github.com/tailscale/mkctr v0.0.0-20220601142259-c0b937af2e89 h1:7xU7AFQE83h0wz/
 github.com/tailscale/mkctr v0.0.0-20220601142259-c0b937af2e89/go.mod h1:OGMqrTzDqmJkGumUTtOv44Rp3/4xS+QFbE8Rn0AGlaU=
 github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85 h1:zrsUcqrG2uQSPhaUPjUQwozcRdDdSxxqhNgNZ3drZFk=
 github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85/go.mod h1:NzVQi3Mleb+qzq8VmcWpSkcSYxXIg0DkI6XDzpVkhJ0=
-github.com/tailscale/wireguard-go v0.0.0-20221219190806-4fa124729667 h1:etWp6uUwKu8NEj37K2OuMBnZ7EnVMKA7gJg5AqPFy/o=
-github.com/tailscale/wireguard-go v0.0.0-20221219190806-4fa124729667/go.mod h1:iiClgxBTruKI+nmzlQxbFw6c3nB/wb4Td/WCyX2berY=
 github.com/tc-hib/winres v0.1.6 h1:qgsYHze+BxQPEYilxIz/KCQGaClvI2+yLBAZs+3+0B8=
 github.com/tc-hib/winres v0.1.6/go.mod h1:pe6dOR40VOrGz8PkzreVKNvEKnlE8t4yR8A8naL+t7A=
 github.com/tcnksm/go-httpstat v0.2.0 h1:rP7T5e5U2HfmOBmZzGgGZjBQ5/GluWUylujl0tJ04I0=
