@@ -48,6 +48,7 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
@@ -823,7 +824,8 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 
 	// Handle node expiry in the netmap
 	if st.NetMap != nil {
-		b.em.flagExpiredPeers(st.NetMap)
+		now := time.Now()
+		b.em.flagExpiredPeers(st.NetMap, now)
 
 		// Always stop the existing netmap timer if we have a netmap;
 		// it's possible that we have no nodes expiring, so we should
@@ -837,31 +839,9 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 			b.nmExpiryTimer = nil
 		}
 
-		now := time.Now()
-
 		// Figure out when the next node in the netmap is expiring so we can
 		// start a timer to reconfigure at that point.
-		var nextExpiry time.Time // zero if none
-		for _, peer := range st.NetMap.Peers {
-			if peer.KeyExpiry.IsZero() {
-				continue // tagged node
-			} else if peer.Expired {
-				// Peer already expired; Expired is set by the
-				// flagExpiredPeers function, above.
-				continue
-			}
-			if nextExpiry.IsZero() || peer.KeyExpiry.Before(nextExpiry) {
-				nextExpiry = peer.KeyExpiry
-			}
-		}
-
-		// Ensure that we also fire this timer if our own node key expires.
-		if st.NetMap.SelfNode != nil {
-			if selfExpiry := st.NetMap.SelfNode.KeyExpiry; !selfExpiry.IsZero() && selfExpiry.Before(nextExpiry) {
-				nextExpiry = selfExpiry
-			}
-		}
-
+		nextExpiry := b.em.nextPeerExpiry(st.NetMap, now)
 		if !nextExpiry.IsZero() {
 			tmrDuration := nextExpiry.Sub(now) + 10*time.Second
 			b.nmExpiryTimer = time.AfterFunc(tmrDuration, func() {
@@ -3822,6 +3802,11 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.capFileSharing = fs
 
 	b.setDebugLogsByCapabilityLocked(nm)
+
+	// See the netns package for documentation on what this capability does.
+	netns.SetBindToInterfaceByRoute(hasCapability(nm, tailcfg.CapabilityBindToInterfaceByRoute))
+	interfaces.SetDisableAlternateDefaultRouteInterface(hasCapability(nm, tailcfg.CapabilityDebugDisableAlternateDefaultRouteInterface))
+	netns.SetDisableBindConnToInterface(hasCapability(nm, tailcfg.CapabilityDebugDisableBindConnToInterface))
 
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	if nm == nil {

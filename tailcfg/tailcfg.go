@@ -1726,6 +1726,22 @@ const (
 	CapabilityDataPlaneAuditLogs = "https://tailscale.com/cap/data-plane-audit-logs" // feature enabled
 	CapabilityDebug              = "https://tailscale.com/cap/debug"                 // exposes debug endpoints over the PeerAPI
 
+	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
+	// sockets (in the net/netns package). See that package for more
+	// details on the behaviour of this capability.
+	CapabilityBindToInterfaceByRoute = "https://tailscale.com/cap/bind-to-interface-by-route"
+
+	// CapabilityDebugDisableAlternateDefaultRouteInterface changes how Darwin
+	// nodes get the default interface. There is an optional hook (used by the
+	// macOS and iOS clients) to override the default interface, this capability
+	// disables that and uses the default behavior (of parsing the routing
+	// table).
+	CapabilityDebugDisableAlternateDefaultRouteInterface = "https://tailscale.com/cap/debug-disable-alternate-default-route-interface"
+
+	// CapabilityDebugDisableBindConnToInterface disables the automatic binding
+	// of connections to the default network interface on Darwin nodes.
+	CapabilityDebugDisableBindConnToInterface = "https://tailscale.com/cap/debug-disable-bind-conn-to-interface"
+
 	// CapabilityTailnetLockAlpha indicates the node is in the tailnet lock alpha,
 	// and initialization of tailnet lock may proceed.
 	//
