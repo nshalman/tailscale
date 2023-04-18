@@ -35,6 +35,7 @@ import (
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
@@ -62,7 +63,7 @@ type ipnLocalBackend interface {
 	NetMap() *netmap.NetworkMap
 	WhoIs(ipp netip.AddrPort) (n *tailcfg.Node, u tailcfg.UserProfile, ok bool)
 	DoNoiseRequest(req *http.Request) (*http.Response, error)
-	TailscaleVarRoot() string
+	Dialer() *tsdial.Dialer
 }
 
 type server struct {
@@ -77,9 +78,31 @@ type server struct {
 
 	// mu protects the following
 	mu                   sync.Mutex
+	httpc                *http.Client                // for calling out to peers.
 	activeConns          map[*conn]bool              // set; value is always true
 	fetchPublicKeysCache map[string]pubKeyCacheEntry // by https URL
 	shutdownCalled       bool
+}
+
+// sessionRecordingClient returns an http.Client that uses srv.lb.Dialer() to
+// dial connections. This is used to make requests to the session recording
+// server to upload session recordings.
+func (srv *server) sessionRecordingClient() *http.Client {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.httpc != nil {
+		return srv.httpc
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return srv.lb.Dialer().UserDial(ctx, network, addr)
+	}
+	srv.httpc = &http.Client{
+		Transport: tr,
+	}
+	return srv.httpc
 }
 
 func (srv *server) now() time.Time {
@@ -987,12 +1010,6 @@ func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) err
 	return nil
 }
 
-// recordSSH is a temporary dev knob to test the SSH recording
-// functionality and support off-node streaming.
-//
-// TODO(bradfitz,maisem): move this to SSHPolicy.
-var recordSSH = envknob.RegisterBool("TS_DEBUG_LOG_SSH")
-
 // run is the entrypoint for a newly accepted SSH session.
 //
 // It handles ss once it's been accepted and determined
@@ -1048,7 +1065,12 @@ func (ss *sshSession) run() {
 			var err error
 			rec, err = ss.startNewRecording()
 			if err != nil {
-				fmt.Fprintf(ss, "can't start new recording\r\n")
+				var uve userVisibleError
+				if errors.As(err, &uve) {
+					fmt.Fprintf(ss, "%s\r\n", uve)
+				} else {
+					fmt.Fprintf(ss, "can't start new recording\r\n")
+				}
 				ss.logf("startNewRecording: %v", err)
 				ss.Exit(1)
 				return
@@ -1060,6 +1082,13 @@ func (ss *sshSession) run() {
 	err := ss.launchProcess()
 	if err != nil {
 		logf("start failed: %v", err.Error())
+		if errors.Is(err, context.Canceled) {
+			err := context.Cause(ss.ctx)
+			var uve userVisibleError
+			if errors.As(err, &uve) {
+				fmt.Fprintf(ss, "%s\r\n", uve)
+			}
+		}
 		ss.Exit(1)
 		return
 	}
@@ -1125,12 +1154,19 @@ func (ss *sshSession) run() {
 	return
 }
 
+// recorders returns the list of recorders to use for this session.
+// If the final action has a non-empty list of recorders, that list is
+// returned. Otherwise, the list of recorders from the initial action
+// is returned.
+func (ss *sshSession) recorders() []netip.AddrPort {
+	if len(ss.conn.finalAction.Recorders) > 0 {
+		return ss.conn.finalAction.Recorders
+	}
+	return ss.conn.action0.Recorders
+}
+
 func (ss *sshSession) shouldRecord() bool {
-	// for now only record pty sessions
-	// TODO(bradfitz,maisem): make configurable on SSHPolicy and
-	// support recording non-pty stuff too.
-	_, _, isPtyReq := ss.Pty()
-	return recordSSH() && isPtyReq
+	return len(ss.recorders()) > 0
 }
 
 type sshConnInfo struct {
@@ -1312,11 +1348,67 @@ func randBytes(n int) []byte {
 	return b
 }
 
+// CastHeader is the header of an asciinema file.
+type CastHeader struct {
+	// Version is the asciinema file format version.
+	Version int `json:"version"`
+
+	// Width is the terminal width in characters.
+	// It is non-zero for Pty sessions.
+	Width int `json:"width"`
+
+	// Height is the terminal height in characters.
+	// It is non-zero for Pty sessions.
+	Height int `json:"height"`
+
+	// Timestamp is the unix timestamp of when the recording started.
+	Timestamp int64 `json:"timestamp"`
+
+	// Env is the environment variables of the session.
+	// Only "TERM" is set (2023-03-22).
+	Env map[string]string `json:"env"`
+
+	// Command is the command that was executed.
+	// Typically empty for shell sessions.
+	Command string `json:"command,omitempty"`
+
+	// Tailscale-specific fields:
+	// SrcNode is the FQDN of the node originating the connection.
+	// It is also the MagicDNS name for the node.
+	// It does not have a trailing dot.
+	// e.g. "host.tail-scale.ts.net"
+	SrcNode string `json:"srcNode"`
+
+	// SrcNodeID is the node ID of the node originating the connection.
+	SrcNodeID tailcfg.StableNodeID `json:"srcNodeID"`
+
+	// SrcNodeTags is the list of tags on the node originating the connection (if any).
+	SrcNodeTags []string `json:"srcNodeTags,omitempty"`
+
+	// SrcNodeUserID is the user ID of the node originating the connection (if not tagged).
+	SrcNodeUserID tailcfg.UserID `json:"srcNodeUserID,omitempty"` // if not tagged
+
+	// SrcNodeUser is the LoginName of the node originating the connection (if not tagged).
+	SrcNodeUser string `json:"srcNodeUser,omitempty"`
+
+	// SSHUser is the username as presented by the client.
+	SSHUser string `json:"sshUser"` // as presented by the client
+
+	// LocalUser is the effective username on the server.
+	LocalUser string `json:"localUser"`
+}
+
 // startNewRecording starts a new SSH session recording.
-//
-// It writes an asciinema file to
-// $TAILSCALE_VAR_ROOT/ssh-sessions/ssh-session-<unixtime>-*.cast.
 func (ss *sshSession) startNewRecording() (_ *recording, err error) {
+	recorders := ss.recorders()
+	if len(recorders) == 0 {
+		return nil, errors.New("no recorders configured")
+	}
+	recorder := recorders[0]
+	if len(recorders) > 1 {
+		ss.logf("warning: multiple recorders configured, using first one: %v", recorder)
+	}
+
 	var w ssh.Window
 	if ptyReq, _, isPtyReq := ss.Pty(); isPtyReq {
 		w = ptyReq.Window
@@ -1332,39 +1424,59 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 		ss:    ss,
 		start: now,
 	}
-	varRoot := ss.conn.srv.lb.TailscaleVarRoot()
-	if varRoot == "" {
-		return nil, errors.New("no var root for recording storage")
-	}
-	dir := filepath.Join(varRoot, "ssh-sessions")
-	if err := os.MkdirAll(dir, 0700); err != nil {
+
+	pr, pw := io.Pipe()
+
+	// We want to use a background context for uploading and not ss.ctx.
+	// ss.ctx is closed when the session closes, but we don't want to break the upload at that time.
+	// Instead we want to wait for the session to close the writer when it finishes.
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("http://%s:%d/record", recorder.Addr(), recorder.Port()), pr)
+	if err != nil {
+		pr.Close()
+		pw.Close()
 		return nil, err
 	}
-	defer func() {
+	// We want to wait for the server to respond with 100 Continue to notifiy us
+	// that it's ready to receive data. We do this to block the session from
+	// starting until the server is ready to receive data.
+	// It also allows the server to reject the request before we start sending
+	// data.
+	req.Header.Set("Expect", "100-continue")
+	go func() {
+		defer pw.Close()
+		ss.logf("starting asciinema recording to %s", recorder)
+		hc := ss.conn.srv.sessionRecordingClient()
+		resp, err := hc.Do(req)
 		if err != nil {
-			rec.Close()
+			err := fmt.Errorf("recording: error sending recording: %w", err)
+			ss.logf("%v", err)
+			ss.cancelCtx(userVisibleError{
+				msg:   "recording: error sending recording",
+				error: err,
+			})
+			return
+		}
+		defer resp.Body.Close()
+		defer ss.cancelCtx(errors.New("recording: done"))
+		if resp.StatusCode != http.StatusOK {
+			err := fmt.Errorf("recording: server responded with %s", resp.Status)
+			ss.logf("%v", err)
+			ss.cancelCtx(userVisibleError{
+				msg:   "recording server responded with: " + resp.Status,
+				error: err,
+			})
 		}
 	}()
 
-	f, err := os.CreateTemp(dir, fmt.Sprintf("ssh-session-%v-*.cast", now.UnixNano()))
-	if err != nil {
-		return nil, err
-	}
-	rec.out = f
+	rec.out = pw
 
-	// {"version": 2, "width": 221, "height": 84, "timestamp": 1647146075, "env": {"SHELL": "/bin/bash", "TERM": "screen"}}
-	type CastHeader struct {
-		Version   int               `json:"version"`
-		Width     int               `json:"width"`
-		Height    int               `json:"height"`
-		Timestamp int64             `json:"timestamp"`
-		Env       map[string]string `json:"env"`
-	}
-	j, err := json.Marshal(CastHeader{
+	ch := CastHeader{
 		Version:   2,
 		Width:     w.Width,
 		Height:    w.Height,
 		Timestamp: now.Unix(),
+		Command:   strings.Join(ss.Command(), " "),
 		Env: map[string]string{
 			"TERM": term,
 			// TODO(bradfitz): anything else important?
@@ -1376,15 +1488,29 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 			// it. Then we can (1) make the cmd, (2) start the
 			// recording, (3) start the process.
 		},
-	})
+		SSHUser:   ss.conn.info.sshUser,
+		LocalUser: ss.conn.localUser.Username,
+		SrcNode:   strings.TrimSuffix(ss.conn.info.node.Name, "."),
+		SrcNodeID: ss.conn.info.node.StableID,
+	}
+	if !ss.conn.info.node.IsTagged() {
+		ch.SrcNodeUser = ss.conn.info.uprof.LoginName
+		ch.SrcNodeUserID = ss.conn.info.node.User
+	} else {
+		ch.SrcNodeTags = ss.conn.info.node.Tags
+	}
+	j, err := json.Marshal(ch)
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
-	ss.logf("starting asciinema recording to %s", f.Name())
 	j = append(j, '\n')
-	if _, err := f.Write(j); err != nil {
-		f.Close()
+	if _, err := pw.Write(j); err != nil {
+		if errors.Is(err, io.ErrClosedPipe) && ss.ctx.Err() != nil {
+			// If we got an io.ErrClosedPipe, it's likely because
+			// the recording server closed the connection on us. Return
+			// the original context error instead.
+			return nil, context.Cause(ss.ctx)
+		}
 		return nil, err
 	}
 	return rec, nil
@@ -1396,7 +1522,7 @@ type recording struct {
 	start time.Time
 
 	mu  sync.Mutex // guards writes to, close of out
-	out *os.File   // nil if closed
+	out io.WriteCloser
 }
 
 func (r *recording) Close() error {
@@ -1415,8 +1541,15 @@ func (r *recording) Close() error {
 // The dir should be "i" for input or "o" for output.
 //
 // If r is nil, it returns w unchanged.
+//
+// Currently (2023-03-21) we only record output, not input.
 func (r *recording) writer(dir string, w io.Writer) io.Writer {
 	if r == nil {
+		return w
+	}
+	if dir == "i" {
+		// TODO: record input? Maybe not, since it might contain
+		// passwords.
 		return w
 	}
 	return &loggingWriter{r, dir, w}

@@ -3,7 +3,7 @@
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHPrincipal,ControlDialPlan --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan --clonefunc
 
 import (
 	"bytes"
@@ -2022,9 +2022,9 @@ type SSHAction struct {
 	// to use local port forwarding if requested.
 	AllowLocalPortForwarding bool `json:"allowLocalPortForwarding,omitempty"`
 
-	// SessionHaulTargetNode, if non-empty, is the Stable ID of a peer to
-	// stream this SSH session's logs to.
-	SessionHaulTargetNode StableNodeID `json:"sessionHaulTargetNode,omitempty"`
+	// Recorders defines the destinations of the SSH session recorders.
+	// The recording will be uploaded to http://addr:port/record.
+	Recorders []netip.AddrPort `json:"recorders"`
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>

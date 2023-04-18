@@ -7,6 +7,7 @@ package tailssh
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -236,6 +238,10 @@ var (
 	testSignerOnce sync.Once
 )
 
+func (ts *localState) Dialer() *tsdial.Dialer {
+	return nil
+}
+
 func (ts *localState) GetSSH_HostKeys() ([]gossh.Signer, error) {
 	testSignerOnce.Do(func() {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -319,9 +325,213 @@ func newSSHRule(action *tailcfg.SSHAction) *tailcfg.SSHRule {
 	}
 }
 
+func TestSSHRecordingCancelsSessionsOnUploadFailure(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+
+	var handler http.HandlerFunc
+	recordingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r)
+	}))
+	defer recordingServer.Close()
+
+	s := &server{
+		logf:  t.Logf,
+		httpc: recordingServer.Client(),
+		lb: &localState{
+			sshEnabled: true,
+			matchingRule: newSSHRule(
+				&tailcfg.SSHAction{
+					Accept: true,
+					Recorders: []netip.AddrPort{
+						netip.MustParseAddrPort(recordingServer.Listener.Addr().String()),
+					},
+				},
+			),
+		},
+	}
+	defer s.Shutdown()
+
+	const sshUser = "alice"
+	cfg := &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	tests := []struct {
+		name             string
+		handler          func(w http.ResponseWriter, r *http.Request)
+		sshCommand       string
+		wantClientOutput string
+
+		clientOutputMustNotContain []string
+	}{
+		{
+			name: "upload-denied",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+			},
+			sshCommand:       "echo hello",
+			wantClientOutput: "recording: server responded with 403 Forbidden\r\n",
+
+			clientOutputMustNotContain: []string{"hello"},
+		},
+		{
+			name: "upload-fails-after-starting",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				r.Body.Read(make([]byte, 1))
+				time.Sleep(100 * time.Millisecond)
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			sshCommand:       "echo hello && sleep 1 && echo world",
+			wantClientOutput: "\r\n\r\nrecording server responded with: 500 Internal Server Error\r\n\r\n",
+
+			clientOutputMustNotContain: []string{"world"},
+		},
+	}
+
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tstest.Replace(t, &handler, tt.handler)
+			sc, dc := memnet.NewTCPConn(src, dst, 1024)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+				if err != nil {
+					t.Errorf("client: %v", err)
+					return
+				}
+				client := gossh.NewClient(c, chans, reqs)
+				defer client.Close()
+				session, err := client.NewSession()
+				if err != nil {
+					t.Errorf("client: %v", err)
+					return
+				}
+				defer session.Close()
+				t.Logf("client established session")
+				got, err := session.CombinedOutput(tt.sshCommand)
+				if err != nil {
+					t.Logf("client got: %q: %v", got, err)
+				} else {
+					t.Errorf("client did not get kicked out: %q", got)
+				}
+				gotStr := string(got)
+				if !strings.HasSuffix(gotStr, tt.wantClientOutput) {
+					t.Errorf("client got %q, want %q", got, tt.wantClientOutput)
+				}
+				for _, x := range tt.clientOutputMustNotContain {
+					if strings.Contains(gotStr, x) {
+						t.Errorf("client output must not contain %q", x)
+					}
+				}
+			}()
+			if err := s.HandleSSHConn(dc); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			wg.Wait()
+		})
+	}
+}
+
+// TestSSHRecordingNonInteractive tests that the SSH server records the SSH session
+// when the client is not interactive (i.e. no PTY).
+// It starts a local SSH server and a recording server. The recording server
+// records the SSH session and returns it to the test.
+// The test then verifies that the recording has a valid CastHeader, it does not
+// validate the contents of the recording.
+func TestSSHRecordingNonInteractive(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+	var recording []byte
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	recordingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer cancel()
+		var err error
+		recording, err = ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}))
+	defer recordingServer.Close()
+
+	s := &server{
+		logf:  logger.Discard,
+		httpc: recordingServer.Client(),
+		lb: &localState{
+			sshEnabled: true,
+			matchingRule: newSSHRule(
+				&tailcfg.SSHAction{
+					Accept: true,
+					Recorders: []netip.AddrPort{
+						must.Get(netip.ParseAddrPort(recordingServer.Listener.Addr().String())),
+					},
+				},
+			),
+		},
+	}
+	defer s.Shutdown()
+
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+	sc, dc := memnet.NewTCPConn(src, dst, 1024)
+
+	const sshUser = "alice"
+	cfg := &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		client := gossh.NewClient(c, chans, reqs)
+		defer client.Close()
+		session, err := client.NewSession()
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		defer session.Close()
+		t.Logf("client established session")
+		_, err = session.CombinedOutput("echo Ran echo!")
+		if err != nil {
+			t.Errorf("client: %v", err)
+		}
+	}()
+	if err := s.HandleSSHConn(dc); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	wg.Wait()
+
+	<-ctx.Done() // wait for recording to finish
+	var ch CastHeader
+	if err := json.NewDecoder(bytes.NewReader(recording)).Decode(&ch); err != nil {
+		t.Fatal(err)
+	}
+	if ch.SSHUser != sshUser {
+		t.Errorf("SSHUser = %q; want %q", ch.SSHUser, sshUser)
+	}
+	if ch.Command != "echo Ran echo!" {
+		t.Errorf("Command = %q; want %q", ch.Command, "echo Ran echo!")
+	}
+}
+
 func TestSSHAuthFlow(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Not running on Linux, skipping")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
 	}
 	acceptRule := newSSHRule(&tailcfg.SSHAction{
 		Accept:  true,
@@ -539,7 +749,8 @@ func TestSSH(t *testing.T) {
 		node:    &tailcfg.Node{},
 		uprof:   tailcfg.UserProfile{},
 	}
-	sc.finalAction = &tailcfg.SSHAction{Accept: true}
+	sc.action0 = &tailcfg.SSHAction{Accept: true}
+	sc.finalAction = sc.action0
 
 	sc.Handler = func(s ssh.Session) {
 		sc.newSSHSession(s).run()
