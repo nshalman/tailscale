@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -o xtrace
+set -o errexit
+
+fail () {
+	echo "$@"
+	exit 1
+}
+
+PREFIX=usr
+
+# On a SmartOS GZ, use /opt
+if [[ $(zonename) == "global" ]] && uname -v | grep -q joyent
+then
+	PREFIX=opt
+fi
+
+svcadm disable -t vpn/tailscale || true
+
+# See https://github.com/nshalman/tailscale/issues/90
+# On hosts currently running taildrive
+# disable is kind of broken
+# clean up manually
+svccfg -s tailscale listprop startd/duration | grep -q contract || \
+	echo "Cleaning up after broken SMF manifest"
+sleep 1
+pkill tailscaled || true
+svcadm disable -st vpn/tailscale || true
+svccfg delete -f vpn/tailscale || true
+
+TMPDIR="$(mktemp -d)"
+pushd "${TMPDIR?}"
+
+DOWNLOAD=https://github.com/nshalman/tailscale/releases/latest/download
+# TODO: Would this work for Solaris?? what is Solaris "uname -o"?
+OS="$(uname -o)"
+
+curl -fLO "${DOWNLOAD}/sha256sums"
+curl -fLO "${DOWNLOAD}/tailscaled-${OS?}"
+curl -fLO "${DOWNLOAD}/tailscale.xml"
+curl -fLO "${DOWNLOAD}/vpn-tailscale"
+
+sha256sum --ignore-missing -c sha256sums
+rm sha256sums
+
+chmod +x "tailscaled-${OS?}"
+mkdir -p "/${PREFIX?}/local/lib/svc/method/"
+chmod +x vpn-tailscale
+mv vpn-tailscale "/${PREFIX?}/local/lib/svc/method/"
+mv "tailscaled-${OS?}" "/${PREFIX?}/local/sbin/tailscaled"
+rm -f "/${PREFIX?}/local/sbin/tailscale"
+ln -s tailscaled "/${PREFIX?}/local/sbin/tailscale"
+<tailscale.xml sed "s/@@PREFIX@@/${PREFIX?}/" > import.xml
+svccfg import import.xml
+svccfg -s vpn/tailscale setprop application/binary="/${PREFIX?}/local/sbin/tailscaled"
+svccfg -s vpn/tailscale setprop application/tun_driver="tun"
+svcadm enable -st vpn/tailscale
+rm tailscale.xml import.xml
+
+popd
+rm -rf "${TMPDIR}"
+
+sleep 2
+tailscale status
+
+echo "To switch to non-tun userspace networking you can run:"
+echo 'svccfg -s vpn/tailscale setprop application/tun_driver="userspace-networking"'
+echo "and then restart tailscale"
