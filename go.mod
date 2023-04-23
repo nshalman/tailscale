@@ -530,3 +530,5 @@ require (
 )
 
 tool github.com/stacklok/frizbee
+
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20260810153021-48918110bfb4
