@@ -559,3 +559,5 @@ tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	github.com/stacklok/frizbee
 )
+
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20261016003909-e81ed16e42a3
