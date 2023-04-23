@@ -4,4 +4,10 @@
 # currently-desired version from https://github.com/tailscale/go,
 # downloading it first if necessary.
 
+case $(uname -s) in
+	SunOS)
+		exec go "$@"
+		;;
+esac
+
 exec "$(dirname "$0")/../tool/gocross/gocross-wrapper.sh" "$@"
