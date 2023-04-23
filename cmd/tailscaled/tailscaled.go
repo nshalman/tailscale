@@ -69,7 +69,7 @@ import (
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
-	case "openbsd":
+	case "openbsd", "illumos", "solaris":
 		return "tun"
 	case "windows":
 		return "Tailscale"
@@ -79,7 +79,7 @@ func defaultTunName() string {
 		return "utun"
 	case "plan9":
 		return "auto"
-	case "aix", "solaris", "illumos":
+	case "aix":
 		return "userspace-networking"
 	case "linux":
 		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
