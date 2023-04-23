@@ -821,6 +821,8 @@ github.com/nishanths/exhaustive v0.10.0 h1:BMznKAcVa9WOoLq/kTGp4NJOJSMwEpcpjFNAV
 github.com/nishanths/exhaustive v0.10.0/go.mod h1:IbwrGdVMizvDcIxPYGVdQn5BqWJaOwpCvg4RGb8r/TA=
 github.com/nishanths/predeclared v0.2.2 h1:V2EPdZPliZymNAn79T8RkNApBjMmVKh5XRpLm/w98Vk=
 github.com/nishanths/predeclared v0.2.2/go.mod h1:RROzoN6TnGQupbC+lqggsOlcgysk3LMK/HI84Mp280c=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20230423150539-55df1b6c04ac h1:wEG2xJ+7q062tBEU8gkJvN2hC5RpZWhEIWAug5LUC0k=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20230423150539-55df1b6c04ac/go.mod h1:J62uaH3KrbhKtrKXQJ6/Z+kcs0r4CdA7qd5AXQtl0/s=
 github.com/nunnatsa/ginkgolinter v0.11.2 h1:xzQpAsEyZe5F1RMy2Z5kn8UFCGiWfKqJOUd2ZzBXA4M=
 github.com/nunnatsa/ginkgolinter v0.11.2/go.mod h1:dJIGXYXbkBswqa/pIzG0QlVTTDSBMxDoCFwhsl4Uras=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
@@ -1064,8 +1066,6 @@ github.com/tailscale/mkctr v0.0.0-20220601142259-c0b937af2e89 h1:7xU7AFQE83h0wz/
 github.com/tailscale/mkctr v0.0.0-20220601142259-c0b937af2e89/go.mod h1:OGMqrTzDqmJkGumUTtOv44Rp3/4xS+QFbE8Rn0AGlaU=
 github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85 h1:zrsUcqrG2uQSPhaUPjUQwozcRdDdSxxqhNgNZ3drZFk=
 github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85/go.mod h1:NzVQi3Mleb+qzq8VmcWpSkcSYxXIg0DkI6XDzpVkhJ0=
-github.com/tailscale/wireguard-go v0.0.0-20230710185534-bb2c8f22eccf h1:bHQHwIHId353jAF2Lm0cGDjJpse/PYS0I0DTtihL9Ls=
-github.com/tailscale/wireguard-go v0.0.0-20230710185534-bb2c8f22eccf/go.mod h1:QRIcq2+DbdIC5sKh/gcAZhuqu6WT6L6G8/ALPN5wqYw=
 github.com/tc-hib/winres v0.2.0 h1:gly/ivDWGvlhl7ENtEmA7wPQ6dWab1LlLq/DgcZECKE=
 github.com/tc-hib/winres v0.2.0/go.mod h1:uG6S5M2Q0/kThoqsCSYvGJODUQP9O9R0SNxUPmFIegw=
 github.com/tcnksm/go-httpstat v0.2.0 h1:rP7T5e5U2HfmOBmZzGgGZjBQ5/GluWUylujl0tJ04I0=
