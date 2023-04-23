@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !wasm && !tamago && !aix && !solaris && !illumos
+//go:build !wasm && !tamago && !aix
 
 // Package tun creates a tuntap device, working around OS-specific
 // quirks if necessary.
