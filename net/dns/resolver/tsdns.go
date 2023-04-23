@@ -350,7 +350,7 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 		// but for now that's probably good enough. Later we'll
 		// want to blend in everything from scutil --dns.
 		fallthrough
-	case "linux", "freebsd", "openbsd", "illumos", "ios":
+	case "linux", "freebsd", "openbsd", "illumos", "solaris", "ios":
 		nameserver, err := stubResolverForOS()
 		if err != nil {
 			r.logf("stubResolverForOS: %v", err)
