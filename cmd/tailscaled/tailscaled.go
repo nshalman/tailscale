@@ -74,7 +74,7 @@ import (
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
-	case "openbsd":
+	case "openbsd", "illumos", "solaris":
 		return "tun"
 	case "windows":
 		return "Tailscale"
@@ -82,7 +82,7 @@ func defaultTunName() string {
 		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
 		// as a magic value that uses/creates any free number.
 		return "utun"
-	case "plan9", "aix", "solaris", "illumos":
+	case "plan9", "aix":
 		return "userspace-networking"
 	case "linux":
 		switch distro.Get() {
