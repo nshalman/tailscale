@@ -612,6 +612,8 @@ func osEmoji(os string) string {
 		return "🐡"
 	case "illumos":
 		return "☀️"
+	case "solaris":
+		return "🌤️"
 	}
 	return "👽"
 }
