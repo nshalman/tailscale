@@ -1,0 +1,32 @@
+name: illumos-Cross
+
+on:
+  push:
+    branches:
+      - main
+      - 'illumos-*'
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+        id: go
+
+      - name: SunOS build script
+        run: bash -x build.sh
