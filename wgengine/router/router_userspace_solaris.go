@@ -141,7 +141,19 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 	}
 	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
 		addrString := fmt.Sprintf("local=%s,remote=%s", addr.String(), addr.Addr().String())
-		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, r.tunname + "/tailscale" + inet(addr)}
+		addrObj := r.tunname + "/tailscale" + inet(addr)
+		// TODO(2024-05-18) fix will be a year old. remove workaround
+		// This is a mitigation to odd behaviour first noticed in 1.44, but that may have existed even before that...
+		// It is *probably* https://www.illumos.org/issues/13316 based on the system where it was seen
+		// I will leave this in place for a while until most distros have pulled in the fix which landed
+		// in upstream illumos on Thu, 18 May 2023 01:24:32 +0000
+		var arg0 = []string{"ipadm", "delete-addr", addrObj}
+		_, err := cmd(arg0...).CombinedOutput()
+		// Under normal circumstances this should fail. If it didn't we have tripped the bug and should log it.
+		if err == nil {
+			r.logf("BUG: unexpected delete-addr success for addrobj: %s", addrObj)
+		}
+		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, addrObj}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
 			r.logf("addr add failed: %v => %v\n%s", arg, err, out)
