@@ -141,7 +141,15 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 	}
 	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
 		addrString := fmt.Sprintf("local=%s,remote=%s", addr.String(), addr.Addr().String())
-		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, r.tunname + "/tailscale" + inet(addr)}
+		addrObj := r.tunname + "/tailscale" + inet(addr)
+		// TODO this is a mitigation to odd behaviour first noticed in 1.44, but that may have existed even before that...
+		var arg0 = []string{"ipadm", "delete-addr", addrObj}
+		_, err := cmd(arg0...).CombinedOutput()
+		// Under normal circumstances this should fail. If it didn't we have tripped the bug and should log it.
+		if err == nil {
+			r.logf("BUG: unexpected delete-addr success for addrobj: %s", addrObj)
+		}
+		var arg = []string{"ipadm", "create-addr", "-t", "-T", "static", "-a", addrString, addrObj}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
 			r.logf("addr add failed: %v => %v\n%s", arg, err, out)
