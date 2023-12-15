@@ -14,8 +14,8 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
-	"tailscale.com/types/logger"
 	"tailscale.com/net/netmon"
+	"tailscale.com/types/logger"
 )
 
 type userspaceSunosRouter struct {
@@ -219,5 +219,12 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 
 func (r *userspaceSunosRouter) Close() error {
 	cleanup(r.logf, r.tunname)
+	return nil
+}
+
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *userspaceSunosRouter) UpdateMagicsockPort(_ uint16, _ string) error {
 	return nil
 }
