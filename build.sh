@@ -23,8 +23,11 @@ for GOOS in illumos solaris; do
 	bash -x ./build_dist.sh --box ./cmd/tailscaled
 	fix_osabi tailscaled
 	mv tailscaled{,-${GOOS}}
+        bash -x ./build_dist.sh --box ./cmd/tailscale
+        fix_osabi tailscale
+        mv tailscale{,-${GOOS}
 done
 
 ln cmd/tailscaled/tailscale.xml .
-shasum -a 256 tailscaled-* tailscale.xml >sha256sums
+shasum -a 256 tailscaled-* tailscale-* tailscale.xml >sha256sums
 rm ./tailscale.xml
