@@ -27,8 +27,16 @@ for GOOS in illumos solaris; do
 	TAGS=${BOX_TAGS} bash -x ./build_dist.sh ./cmd/tailscaled
 	fix_osabi tailscaled
 	mv tailscaled{,-${GOOS}}
+	# Build plain daemon binary
+	bash -x ./build_dist.sh ./cmd/tailscaled
+	fix_osabi tailscaled
+	mv tailscaled{,-plain-${GOOS}}
+	# Build plain client binary
+	bash -x ./build_dist.sh ./cmd/tailscale
+	fix_osabi tailscale
+	mv tailscale{,-${GOOS}}
 done
 
 ln cmd/tailscaled/tailscale.xml .
-shasum -a 256 tailscaled-* tailscale.xml >sha256sums
+shasum -a 256 tailscaled-* tailscale-* tailscale.xml >sha256sums
 rm ./tailscale.xml
