@@ -13,12 +13,12 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           check-latest: true
@@ -37,5 +37,9 @@ jobs:
             cmd/tailscaled/smf/tailscale.xml
             cmd/tailscaled/smf/vpn-tailscale
             sha256sums
+            tailscale-illumos
+            tailscale-solaris
             tailscaled-illumos
             tailscaled-solaris
+            tailscaled-plain-illumos
+            tailscaled-plain-solaris
