@@ -20,12 +20,19 @@ fix_osabi () {
 
 for GOOS in illumos solaris; do
 	export GOOS
+	# Build "box" binary that can be both daemon and client
+	# Continuing to use the same name as before
 	bash -x ./build_dist.sh --box ./cmd/tailscaled
 	fix_osabi tailscaled
 	mv tailscaled{,-${GOOS}}
-        bash -x ./build_dist.sh --box ./cmd/tailscale
-        fix_osabi tailscale
-        mv tailscale{,-${GOOS}
+	# Build plain daemon binary
+	bash -x ./build_dist.sh ./cmd/tailscaled
+	fix_osabi tailscaled
+	mv tailscaled{,-plain-${GOOS}}
+	# Build plain client binary
+	bash -x ./build_dist.sh ./cmd/tailscale
+	fix_osabi tailscale
+	mv tailscale{,-${GOOS}}
 done
 
 ln cmd/tailscaled/tailscale.xml .

@@ -35,7 +35,9 @@ jobs:
           files: |
             cmd/tailscaled/tailscale.xml
             sha256sums
-            tailscaled-illumos
-            tailscaled-solaris
             tailscale-illumos
             tailscale-solaris
+            tailscaled-illumos
+            tailscaled-solaris
+            tailscaled-plain-illumos
+            tailscaled-plain-solaris
