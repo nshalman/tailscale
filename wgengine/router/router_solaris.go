@@ -17,7 +17,7 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *netmon.Mon
 	return newUserspaceSunosRouter(logf, tundev, linkMon)
 }
 
-func cleanup(logf logger.Logf, interfaceName string) {
+func cleanUp(logf logger.Logf, interfaceName string) {
 	ipadm := []string{"ipadm", "show-addr", "-p", "-o", "addrobj"}
 	out, err := cmd(ipadm...).Output()
 	if err != nil {

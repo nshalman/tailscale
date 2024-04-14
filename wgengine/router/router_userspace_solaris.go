@@ -218,7 +218,7 @@ func (r *userspaceSunosRouter) Set(cfg *Config) (reterr error) {
 }
 
 func (r *userspaceSunosRouter) Close() error {
-	cleanup(r.logf, r.tunname)
+	cleanUp(r.logf, r.tunname)
 	return nil
 }
 
