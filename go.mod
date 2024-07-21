@@ -392,4 +392,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
 )
 
-replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20230423150539-55df1b6c04ac
+replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go tailscale-1.70
