@@ -714,8 +714,8 @@ github.com/nishanths/exhaustive v0.10.0 h1:BMznKAcVa9WOoLq/kTGp4NJOJSMwEpcpjFNAV
 github.com/nishanths/exhaustive v0.10.0/go.mod h1:IbwrGdVMizvDcIxPYGVdQn5BqWJaOwpCvg4RGb8r/TA=
 github.com/nishanths/predeclared v0.2.2 h1:V2EPdZPliZymNAn79T8RkNApBjMmVKh5XRpLm/w98Vk=
 github.com/nishanths/predeclared v0.2.2/go.mod h1:RROzoN6TnGQupbC+lqggsOlcgysk3LMK/HI84Mp280c=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20230423150539-55df1b6c04ac h1:wEG2xJ+7q062tBEU8gkJvN2hC5RpZWhEIWAug5LUC0k=
-github.com/nshalman/wireguard-go v0.0.20200321-0.20230423150539-55df1b6c04ac/go.mod h1:J62uaH3KrbhKtrKXQJ6/Z+kcs0r4CdA7qd5AXQtl0/s=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20240721132139-a83c7dd50696 h1:eom4+gom4t2d1SHP28XEUDsw7w/10gIWCXrl1radVmU=
+github.com/nshalman/wireguard-go v0.0.20200321-0.20240721132139-a83c7dd50696/go.mod h1:BOm5fXUBFM+m9woLNBoxI9TaBXXhGNP50LX/TGIvGb4=
 github.com/nunnatsa/ginkgolinter v0.11.2 h1:xzQpAsEyZe5F1RMy2Z5kn8UFCGiWfKqJOUd2ZzBXA4M=
 github.com/nunnatsa/ginkgolinter v0.11.2/go.mod h1:dJIGXYXbkBswqa/pIzG0QlVTTDSBMxDoCFwhsl4Uras=
 github.com/nxadm/tail v1.4.8 h1:nPr65rt6Y5JFSKQO7qToXr7pePgD6Gwiw05lkbyAQTE=
