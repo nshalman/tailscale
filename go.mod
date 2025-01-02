@@ -407,3 +407,7 @@ require (
 )
 
 replace github.com/tailscale/wireguard-go => github.com/nshalman/wireguard-go v0.0.20200321-0.20240821122409-fbd66f85d5bc
+
+replace github.com/tailscale/peercred => github.com/nshalman/peercred v0.0.0-20250102182558-f958acd704dc
+
+replace golang.org/x/sys => github.com/nshalman/sys v0.0.0-20250102180706-4e307e501a47
