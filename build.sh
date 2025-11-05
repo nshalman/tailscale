@@ -24,9 +24,12 @@ fix_osabi () {
 
 for GOOS in illumos solaris; do
 	export GOOS
-	TAGS=${BOX_TAGS} bash -x ./build_dist.sh ./cmd/tailscaled
+	TAGS=ts_include_cli bash -x ./build_dist.sh ./cmd/tailscaled
 	fix_osabi tailscaled
 	mv tailscaled{,-${GOOS}}
+	TAGS=${BOX_TAGS} bash -x ./build_dist.sh ./cmd/tailscaled
+	fix_osabi tailscaled
+	mv tailscaled{,-minimal-${GOOS}}
 	# Build plain daemon binary
 	bash -x ./build_dist.sh ./cmd/tailscaled
 	fix_osabi tailscaled
