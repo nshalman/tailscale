@@ -40,6 +40,8 @@ for GOOS in illumos solaris; do
 	mv tailscale{,-${GOOS}}
 done
 
-ln cmd/tailscaled/tailscale.xml .
-shasum -a 256 tailscaled-* tailscale-* tailscale.xml >sha256sums
-rm ./tailscale.xml
+ln cmd/tailscaled/smf/tailscale.xml .
+ln cmd/tailscaled/smf/vpn-tailscale .
+ln cmd/tailscaled/smf/install .
+shasum -a 256 install tailscaled-* tailscale-* tailscale.xml vpn-tailscale>sha256sums
+rm ./tailscale.xml ./vpn-tailscale ./install
