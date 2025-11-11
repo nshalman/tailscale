@@ -33,7 +33,9 @@ jobs:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           prerelease: false
           files: |
-            cmd/tailscaled/tailscale.xml
+            cmd/tailscaled/smf/install
+            cmd/tailscaled/smf/tailscale.xml
+            cmd/tailscaled/smf/vpn-tailscale
             sha256sums
             tailscale-illumos
             tailscale-solaris
