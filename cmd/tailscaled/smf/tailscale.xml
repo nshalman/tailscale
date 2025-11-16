@@ -17,6 +17,7 @@
     <exec_method name='stop' type='method' exec='/@@PREFIX@@/local/lib/svc/method/vpn-tailscale %m %{restarter/contract}' timeout_seconds='5'/>
     <property_group name='application' type='application'>
       <propval name='binary' type='astring' value='/@@PREFIX@@/local/sbin/tailscaled'/>
+      <propval name='tun_driver' type='astring' value='tun'/>
     </property_group>
     <stability value='Evolving'/>
     <template>
