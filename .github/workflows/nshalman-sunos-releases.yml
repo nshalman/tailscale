@@ -1,0 +1,45 @@
+---
+name: "tagged-release"
+
+on:
+  push:
+    tags:
+      - "v*-sunos"
+
+jobs:
+  tagged-release:
+    name: "SunOS Tagged Release"
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+        id: go
+
+      - name: SunOS build script
+        run: bash -x build.sh
+
+      - name: Create Release
+        uses: "marvinpinto/action-automatic-releases@latest"
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          prerelease: false
+          files: |
+            cmd/tailscaled/smf/install
+            cmd/tailscaled/smf/tailscale.xml
+            cmd/tailscaled/smf/vpn-tailscale
+            sha256sums
+            tailscale-illumos
+            tailscale-solaris
+            tailscaled-illumos
+            tailscaled-solaris
+            tailscaled-plain-illumos
+            tailscaled-plain-solaris
