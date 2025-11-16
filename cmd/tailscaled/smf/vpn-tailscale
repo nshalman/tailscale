@@ -3,14 +3,15 @@
 
 . /lib/svc/share/smf_include.sh
 
-TAILSCALED=$(svcprop -p application/binary $SMF_FMRI)
+TAILSCALED=$(svcprop -c -p application/binary "$SMF_FMRI")
+TUN_DRIVER=$(svcprop -c -p application/tun_driver "$SMF_FMRI")
 case "$1" in
 start)
 	smf_clear_env
-	"${TAILSCALED?}" &
+	"${TAILSCALED?}" -tun "${TUN_DRIVER?}" &
 	;;
 stop)
-	smf_kill_contract $2 TERM 60
+	smf_kill_contract "$2" TERM 60
 	"${TAILSCALED?}" --cleanup
 	;;
 *)
@@ -19,4 +20,4 @@ stop)
 	;;
 esac
 
-exit $SMF_EXIT_OK
+exit "$SMF_EXIT_OK"

@@ -54,6 +54,7 @@ ln -s tailscaled "/${PREFIX?}/local/sbin/tailscale"
 <tailscale.xml sed "s/@@PREFIX@@/${PREFIX?}/" > import.xml
 svccfg import import.xml
 svccfg -s vpn/tailscale setprop application/binary="/${PREFIX?}/local/sbin/tailscaled"
+svccfg -s vpn/tailscale setprop application/tun_driver="tun"
 svcadm enable -st vpn/tailscale
 rm tailscale.xml import.xml
 
@@ -62,3 +63,7 @@ rm -rf "${TMPDIR}"
 
 sleep 2
 tailscale status
+
+echo "To switch to non-tun userspace networking you can run:"
+echo 'svccfg -s vpn/tailscale setprop application/tun_driver="userspace-networking"'
+echo "and then restart tailscale"
