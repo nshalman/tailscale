@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,86 @@ func TestTailchonkFS_CommitTime(t *testing.T) {
 	}
 	if ct.Before(time.Now().Add(-time.Minute)) || ct.After(time.Now().Add(time.Minute)) {
 		t.Errorf("commit time was wrong: %v more than a minute off from now (%v)", ct, time.Now())
+	}
+}
+
+// If we were interrupted while writing a temporary file, AllAUMs()
+// should ignore it when scanning the AUM directory.
+func TestTailchonkFS_IgnoreTempFile(t *testing.T) {
+	base := t.TempDir()
+	chonk := must.Get(ChonkDir(base))
+	parentHash := randHash(t, 1)
+	aum := AUM{MessageKind: AUMNoOp, PrevAUMHash: parentHash[:]}
+	must.Do(chonk.CommitVerifiedAUMs([]AUM{aum}))
+
+	writeAUMFile := func(filename, contents string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(base, filename[0:2]), os.ModePerm); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(base, filename[0:2], filename), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Check that calling AllAUMs() returns the single committed AUM
+	got, err := chonk.AllAUMs()
+	if err != nil {
+		t.Fatalf("AllAUMs() failed: %v", err)
+	}
+	want := []AUMHash{aum.Hash()}
+	if !slices.Equal(got, want) {
+		t.Fatalf("AllAUMs() is wrong: got %v, want %v", got, want)
+	}
+
+	// Write some temporary files which are named like partially-committed AUMs,
+	// then check that AllAUMs() only returns the single committed AUM.
+	writeAUMFile("AUM1234.tmp", "incomplete AUM\n")
+	writeAUMFile("AUM1234.tmp_123", "second incomplete AUM\n")
+
+	got, err = chonk.AllAUMs()
+	if err != nil {
+		t.Fatalf("AllAUMs() failed: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("AllAUMs() is wrong: got %v, want %v", got, want)
+	}
+}
+
+// If we use a non-existent directory with filesystem Chonk storage,
+// it's automatically created.
+func TestTailchonkFS_CreateChonkDir(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "a", "b", "c")
+
+	chonk, err := ChonkDir(base)
+	if err != nil {
+		t.Fatalf("ChonkDir: %v", err)
+	}
+
+	aum := AUM{MessageKind: AUMNoOp}
+	must.Do(chonk.CommitVerifiedAUMs([]AUM{aum}))
+
+	got, err := chonk.AUM(aum.Hash())
+	if err != nil {
+		t.Errorf("Chonk.AUM: %v", err)
+	}
+	if diff := cmp.Diff(got, aum); diff != "" {
+		t.Errorf("wrong AUM; (-got+want):%v", diff)
+	}
+
+	if _, err := os.Stat(base); err != nil {
+		t.Errorf("os.Stat: %v", err)
+	}
+}
+
+// You can't use a file as the root of your filesystem Chonk storage.
+func TestTailchonkFS_CannotUseFile(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "tka_storage.txt")
+	must.Do(os.WriteFile(base, []byte("this won't work"), 0644))
+
+	_, err := ChonkDir(base)
+	if err == nil {
+		t.Fatal("ChonkDir succeeded; expected an error")
 	}
 }
 
@@ -452,7 +533,7 @@ func (c *compactingChonkFake) PurgeAUMs(hashes []AUMHash) error {
 
 // Avoid go vet complaining about copying a lock value
 func cloneMem(src, dst *Mem) {
-	dst.l = sync.RWMutex{}
+	dst.mu = sync.RWMutex{}
 	dst.aums = src.aums
 	dst.parentIndex = src.parentIndex
 	dst.lastActiveAncestor = src.lastActiveAncestor

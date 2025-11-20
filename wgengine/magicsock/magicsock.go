@@ -651,7 +651,9 @@ func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	derpAddr := ep.derpAddr
-	go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key, allocResp.Message, discoVerboseLog)
+	if derpAddr.IsValid() {
+		go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key, allocResp.Message, discoVerboseLog)
+	}
 }
 
 // Synchronize waits for all [eventbus] events published
@@ -2442,7 +2444,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if !nodeHasCap(c.filt, c.peers.At(peerI), c.self, tailcfg.PeerCapabilityRelay) {
 			return
 		}
-		c.allocRelayEndpointPub.Publish(UDPRelayAllocReq{
+		// [Conn.mu] must not be held while publishing, or [Conn.onUDPRelayAllocResp]
+		// can deadlock as the req sub and resp pub are the same goroutine.
+		// See #17830.
+		go c.allocRelayEndpointPub.Publish(UDPRelayAllocReq{
 			RxFromDiscoKey: sender,
 			RxFromNodeKey:  nodeKey,
 			Message:        req,

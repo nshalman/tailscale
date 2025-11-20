@@ -21,7 +21,6 @@ import (
 
 	"go4.org/mem"
 	"golang.org/x/net/ipv6"
-	"tailscale.com/client/local"
 	"tailscale.com/disco"
 	"tailscale.com/net/batching"
 	"tailscale.com/net/netaddr"
@@ -32,6 +31,7 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/net/udprelay/status"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -72,15 +72,22 @@ type Server struct {
 	closeCh             chan struct{}
 	netChecker          *netcheck.Client
 
-	mu                sync.Mutex       // guards the following fields
+	mu                sync.Mutex // guards the following fields
+	derpMap           *tailcfg.DERPMap
 	addrDiscoveryOnce bool             // addrDiscovery completed once (successfully or unsuccessfully)
 	addrPorts         []netip.AddrPort // the ip:port pairs returned as candidate endpoints
 	closed            bool
 	lamportID         uint64
-	vniPool           []uint32 // the pool of available VNIs
+	nextVNI           uint32
 	byVNI             map[uint32]*serverEndpoint
 	byDisco           map[key.SortedPairOfDiscoPublic]*serverEndpoint
 }
+
+const (
+	minVNI           = uint32(1)
+	maxVNI           = uint32(1<<24 - 1)
+	totalPossibleVNI = maxVNI - minVNI + 1
+)
 
 // serverEndpoint contains Server-internal [endpoint.ServerEndpoint] state.
 // serverEndpoint methods are not thread-safe.
@@ -281,15 +288,10 @@ func NewServer(logf logger.Logf, port int, overrideAddrs []netip.Addr) (s *Serve
 		steadyStateLifetime: defaultSteadyStateLifetime,
 		closeCh:             make(chan struct{}),
 		byDisco:             make(map[key.SortedPairOfDiscoPublic]*serverEndpoint),
+		nextVNI:             minVNI,
 		byVNI:               make(map[uint32]*serverEndpoint),
 	}
 	s.discoPublic = s.disco.Public()
-	// TODO: instead of allocating 10s of MBs for the full pool, allocate
-	// smaller chunks and increase as needed
-	s.vniPool = make([]uint32, 0, 1<<24-1)
-	for i := 1; i < 1<<24; i++ {
-		s.vniPool = append(s.vniPool, uint32(i))
-	}
 
 	// TODO(creachadair): Find a way to plumb this in during initialization.
 	// As-written, messages published here will not be seen by other components
@@ -373,15 +375,12 @@ func (s *Server) addrDiscoveryLoop() {
 			}
 		}
 
-		// fetch DERPMap to feed to netcheck
-		derpMapCtx, derpMapCancel := context.WithTimeout(context.Background(), time.Second)
-		defer derpMapCancel()
-		localClient := &local.Client{}
-		// TODO(jwhited): We are in-process so use eventbus or similar.
-		//  local.Client gets us going.
-		dm, err := localClient.CurrentDERPMap(derpMapCtx)
-		if err != nil {
-			return nil, err
+		dm := s.getDERPMap()
+		if dm == nil {
+			// We don't have a DERPMap which is required to dynamically
+			// discover external addresses, but we can return the endpoints we
+			// do have.
+			return addrPorts.Slice(), nil
 		}
 
 		// get addrPorts as visible from DERP
@@ -557,7 +556,6 @@ func (s *Server) Close() error {
 		defer s.mu.Unlock()
 		clear(s.byVNI)
 		clear(s.byDisco)
-		s.vniPool = nil
 		s.closed = true
 		s.bus.Close()
 	})
@@ -579,7 +577,6 @@ func (s *Server) endpointGCLoop() {
 			if v.isExpired(now, s.bindLifetime, s.steadyStateLifetime) {
 				delete(s.byDisco, k)
 				delete(s.byVNI, v.vni)
-				s.vniPool = append(s.vniPool, v.vni)
 			}
 		}
 	}
@@ -714,6 +711,27 @@ func (e ErrServerNotReady) Error() string {
 	return fmt.Sprintf("server not ready, retry after %v", e.RetryAfter)
 }
 
+// getNextVNILocked returns the next available VNI. It implements the
+// "Traditional BSD Port Selection Algorithm" from RFC6056. This algorithm does
+// not attempt to obfuscate the selection, i.e. the selection is predictable.
+// For now, we favor simplicity and reducing VNI re-use over more complex
+// ephemeral port (VNI) selection algorithms.
+func (s *Server) getNextVNILocked() (uint32, error) {
+	for i := uint32(0); i < totalPossibleVNI; i++ {
+		vni := s.nextVNI
+		if vni == maxVNI {
+			s.nextVNI = minVNI
+		} else {
+			s.nextVNI++
+		}
+		_, ok := s.byVNI[vni]
+		if !ok {
+			return vni, nil
+		}
+	}
+	return 0, errors.New("VNI pool exhausted")
+}
+
 // AllocateEndpoint allocates an [endpoint.ServerEndpoint] for the provided pair
 // of [key.DiscoPublic]'s. If an allocation already exists for discoA and discoB
 // it is returned without modification/reallocation. AllocateEndpoint returns
@@ -762,8 +780,9 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		}, nil
 	}
 
-	if len(s.vniPool) == 0 {
-		return endpoint.ServerEndpoint{}, errors.New("VNI pool exhausted")
+	vni, err := s.getNextVNILocked()
+	if err != nil {
+		return endpoint.ServerEndpoint{}, err
 	}
 
 	s.lamportID++
@@ -771,10 +790,10 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		discoPubKeys: pair,
 		lamportID:    s.lamportID,
 		allocatedAt:  time.Now(),
+		vni:          vni,
 	}
 	e.discoSharedSecrets[0] = s.disco.Shared(e.discoPubKeys.Get()[0])
 	e.discoSharedSecrets[1] = s.disco.Shared(e.discoPubKeys.Get()[1])
-	e.vni, s.vniPool = s.vniPool[0], s.vniPool[1:]
 
 	s.byDisco[pair] = e
 	s.byVNI[e.vni] = e
@@ -827,4 +846,22 @@ func (s *Server) GetSessions() []status.ServerSession {
 		})
 	}
 	return sessions
+}
+
+// SetDERPMapView sets the [tailcfg.DERPMapView] to use for future netcheck
+// reports.
+func (s *Server) SetDERPMapView(view tailcfg.DERPMapView) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !view.Valid() {
+		s.derpMap = nil
+		return
+	}
+	s.derpMap = view.AsStruct()
+}
+
+func (s *Server) getDERPMap() *tailcfg.DERPMap {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.derpMap
 }
