@@ -41,7 +41,7 @@ curl -fLO "${DOWNLOAD}/tailscaled-${OS?}"
 curl -fLO "${DOWNLOAD}/tailscale.xml"
 curl -fLO "${DOWNLOAD}/vpn-tailscale"
 
-sha256sum --ignore-missing -c sha256sums
+shasum -a 256 --ignore-missing -c sha256sums
 rm sha256sums
 
 chmod +x "tailscaled-${OS?}"
