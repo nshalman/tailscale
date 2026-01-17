@@ -55,6 +55,7 @@ ln -s tailscaled "/${PREFIX?}/local/sbin/tailscale"
 svccfg import import.xml
 svccfg -s vpn/tailscale setprop application/binary="/${PREFIX?}/local/sbin/tailscaled"
 svccfg -s vpn/tailscale setprop application/tun_driver="tun"
+mkdir -p /var/lib/tailscale
 svcadm enable -st vpn/tailscale
 rm tailscale.xml import.xml
 
