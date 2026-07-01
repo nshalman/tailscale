@@ -39,6 +39,9 @@ import (
 	"go4.org/mem"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	extwgconn "golang.zx2c4.com/wireguard/conn"
+	extwgdevice "golang.zx2c4.com/wireguard/device"
+	extwgtest "golang.zx2c4.com/wireguard/tun/tuntest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
@@ -2250,17 +2253,20 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 }
 
 // newWireguard starts up a new wireguard-go device attached to a test tun, and
-// returns the device, tun and endpoint port. To add peers call device.IpcSet with UAPI instructions.
-func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Device, *tuntest.ChannelTUN, uint16) {
-	wgtun := tuntest.NewChannelTUN()
+// returns the device, tun and endpoint port. To add peers call device.IpcSet
+// with UAPI instructions.
+//
+// This uses stock wireguard-go to simulate a non-Tailscale peer.
+func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*extwgdevice.Device, *extwgtest.ChannelTUN, uint16) {
+	wgtun := extwgtest.NewChannelTUN()
 	wglogf := func(f string, args ...any) {
 		t.Logf("wg-go: "+f, args...)
 	}
-	wglog := device.Logger{
+	wglog := extwgdevice.Logger{
 		Verbosef: func(string, ...any) {},
 		Errorf:   wglogf,
 	}
-	wgdev := wgcfg.NewDevice(wgtun.TUN(), wgconn.NewDefaultBind(), &wglog)
+	wgdev := extwgdevice.NewDevice(wgtun.TUN(), extwgconn.NewDefaultBind(), &wglog)
 
 	if err := wgdev.IpcSet(uapi); err != nil {
 		t.Fatal(err)
@@ -4436,6 +4442,10 @@ func TestSendingTSMPDiscoTimer(t *testing.T) {
 	tw := eventbustest.NewWatcher(t, conn.eventBus)
 	t.Cleanup(func() { conn.Close() })
 
+	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
+	conn.controlKnobs = new(controlknobs.Knobs)
+	conn.controlKnobs.CacheNetworkMaps.Store(true)
+
 	peerKey := key.NewNode().Public()
 	ep := &endpoint{
 		nodeID:    1,
@@ -4495,5 +4505,104 @@ func TestSendingTSMPDiscoTimer(t *testing.T) {
 	conn.maybeSendTSMPDiscoAdvert(ep)
 	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
 		t.Errorf("expected only one event, got: %s", err)
+	}
+}
+
+// TestSendingTSMPDiscoCachingDisabled verifies that maybeSendTSMPDiscoAdvert
+// early-returns (sends no advert) when netmap caching is not enabled via the
+// CacheNetworkMaps control knob, including when no knobs are present at all.
+func TestSendingTSMPDiscoCachingDisabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		knobs *controlknobs.Knobs
+	}{
+		{name: "no-knobs", knobs: nil},
+		// Knobs present but CacheNetworkMaps left at its false default.
+		{name: "caching-disabled", knobs: new(controlknobs.Knobs)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newTestConn(t)
+			t.Cleanup(func() { conn.Close() })
+			conn.controlKnobs = tt.knobs
+
+			ep := &endpoint{
+				nodeID:    1,
+				publicKey: key.NewNode().Public(),
+				nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+			}
+			ep.c = conn
+
+			// A fresh endpoint with a zero lastDiscoKeyAdvertisement and no
+			// direct bestAddr would otherwise advertise; the only thing
+			// suppressing it here is the disabled caching knob. On early
+			// return the timestamp is left untouched (zero).
+			conn.maybeSendTSMPDiscoAdvert(ep)
+
+			ep.mu.Lock()
+			defer ep.mu.Unlock()
+			if !ep.lastDiscoKeyAdvertisement.IsZero() {
+				t.Errorf("lastDiscoKeyAdvertisement = %v; want zero (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement)
+			}
+		})
+	}
+}
+
+// TestSendingTSMPDiscoPeerRelaySuppressed verifies that maybeSendTSMPDiscoAdvert
+// suppresses the advert when the bestAddr is a peer relay path (a non-zero
+// addrQuality whose epAddr has a VNI set), even though such a path is not
+// direct. Suppression is observed via lastDiscoKeyAdvertisement remaining
+// unchanged, since a fired advert would overwrite it with the current time.
+func TestSendingTSMPDiscoPeerRelaySuppressed(t *testing.T) {
+	conn := newTestConn(t)
+	t.Cleanup(func() { conn.Close() })
+
+	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
+	conn.controlKnobs = new(controlknobs.Knobs)
+	conn.controlKnobs.CacheNetworkMaps.Store(true)
+
+	peerKey := key.NewNode().Public()
+	ep := &endpoint{
+		nodeID:    1,
+		publicKey: peerKey,
+		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+	}
+	discoKey := key.NewDisco().Public()
+	ep.disco.Store(&endpointDisco{
+		key:   discoKey,
+		short: discoKey.ShortString(),
+	})
+	ep.c = conn
+	conn.mu.Lock()
+	nodeView := (&tailcfg.Node{
+		Key: ep.publicKey,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.1/32"),
+		},
+	}).View()
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
+	conn.mu.Unlock()
+
+	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+
+	// A peer relay bestAddr: an epAddr with a VNI set. It is past the
+	// rate-limit interval with a non-zero lastDiscoKeyAdvertisement, so the
+	// only thing suppressing the advert is the active (non-zero) bestAddr.
+	var vni packet.VirtualNetworkID
+	vni.Set(7)
+	lastAdvert := mono.Now().Add(-discoKeyAdvertisementInterval - time.Second)
+	ep.mu.Lock()
+	ep.lastDiscoKeyAdvertisement = lastAdvert
+	ep.bestAddr = addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.2.3.4:567"), vni: vni}}
+	ep.mu.Unlock()
+
+	conn.maybeSendTSMPDiscoAdvert(ep)
+
+	// A fired advert would have overwritten lastDiscoKeyAdvertisement with the
+	// current time; confirm it was left untouched, indicating suppression.
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.lastDiscoKeyAdvertisement != lastAdvert {
+		t.Errorf("lastDiscoKeyAdvertisement = %v; want unchanged %v (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement, lastAdvert)
 	}
 }
