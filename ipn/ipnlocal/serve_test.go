@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -985,6 +986,176 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 				if got != c.want {
 					t.Errorf("invalid %q header; want=%q, got=%q", c.header, c.want, got)
 				}
+			}
+		})
+	}
+}
+
+// newAppCapsTestBackend returns a test backend whose peer at 100.150.151.152
+// holds the example.com/cap/interesting capability for the node 100.150.151.151.
+func newAppCapsTestBackend(t *testing.T) *LocalBackend {
+	b := newTestBackend(t)
+
+	nm := b.NetMapWithPeers()
+	matches, err := filter.MatchesFromFilterRules([]tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.150.151.152"},
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{
+					netip.MustParsePrefix("100.150.151.151/32"),
+				},
+				CapMap: tailcfg.PeerCapMap{
+					"example.com/cap/interesting": []tailcfg.RawMessage{
+						`{"role": "engineer"}`,
+					},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nm.PacketFilter = matches
+	b.SetControlClientStatus(nil, controlclient.Status{NetMap: nm})
+	return b
+}
+
+// appCapsEchoServer returns a test backend that echoes the
+// Tailscale-App-Capabilities request header in its response body.
+func appCapsEchoServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	testServ := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, r.Header.Get("Tailscale-App-Capabilities"))
+		},
+	))
+	t.Cleanup(testServ.Close)
+	return testServ
+}
+
+// TestServeAppCapsConcurrentStreams verifies that app capabilities accepted by one
+// serve mount are not forwarded for requests to another mount, when the requests
+// share the connection-scoped serveHTTPContext the way concurrent h2 streams do.
+func TestServeAppCapsConcurrentStreams(t *testing.T) {
+	b := newAppCapsTestBackend(t)
+	testServ := appCapsEchoServer(t)
+
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+				"/ops": {
+					Proxy:         testServ.URL,
+					AcceptAppCaps: []peercap.Cap{"example.com/cap/interesting"},
+				},
+				"/admin": {
+					Proxy: testServ.URL, // accepts no capabilities
+				},
+			}},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// One connection-scoped serveHTTPContext
+	connCtx := serveHTTPContextKey.WithValue(t.Context(), &serveHTTPContext{
+		DestPort: 443,
+		SrcAddr:  netip.MustParseAddrPort("100.150.151.152:1234"),
+	})
+
+	newReq := func(path string) *http.Request {
+		req := &http.Request{
+			URL: &url.URL{Path: path},
+			TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+		}
+		return req.WithContext(connCtx)
+	}
+
+	const rounds = 200
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2*rounds) // both mounts can fail every round
+	for range rounds {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, newReq("/ops"))
+			if got := w.Body.String(); got == "" {
+				errCh <- fmt.Errorf("/ops: capabilities header missing")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, newReq("/admin"))
+			if got := w.Body.String(); got != "" {
+				errCh <- fmt.Errorf("/admin: unexpected capabilities header %q", got)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// TestServeAppCapsPerRequest verifies that the accepted capabilities
+// forwarded to the backend match the mount that served each request.
+func TestServeAppCapsPerRequest(t *testing.T) {
+	b := newAppCapsTestBackend(t)
+	testServ := appCapsEchoServer(t)
+
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+				"/": {
+					Proxy:         testServ.URL,
+					AcceptAppCaps: []peercap.Cap{"example.com/cap/interesting"},
+				},
+				"/text": {
+					Text: "not proxied", // no proxy, no capabilities involved
+				},
+			}},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		path     string
+		wantBody string
+	}{
+		{
+			name:     "accepting_mount_forwards_caps",
+			path:     "/",
+			wantBody: `{"example.com/cap/interesting":[{"role":"engineer"}]}`,
+		},
+		{
+			name:     "text_mount_no_caps",
+			path:     "/text",
+			wantBody: "not proxied",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{
+				URL: &url.URL{Path: tt.path},
+				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+				DestPort: 443,
+				SrcAddr:  netip.MustParseAddrPort("100.150.151.152:1234"),
+			}))
+
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+
+			if got := w.Body.String(); got != tt.wantBody {
+				t.Errorf("capabilities header; want=%q got=%q", tt.wantBody, got)
 			}
 		})
 	}
@@ -2040,5 +2211,128 @@ func TestValidateServeConfigUpdate(t *testing.T) {
 				t.Error("expected error, got nil;", tt.description)
 			}
 		})
+	}
+}
+
+// mkTempSocket creates an empty file to stand in for a unix socket and returns
+// its path. isTailscaledSocket matches by os.SameFile, so a regular file is
+// enough and its name does not matter.
+func mkTempSocket(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	return f.Name()
+}
+
+// TestServeTargetsTailscaledSocket checks the guard that refuses a serve config
+// proxying to tailscaled's own socket, across every place a handler can live and
+// through a symlink alias.
+func TestServeTargetsTailscaledSocket(t *testing.T) {
+	b := newTestBackend(t)
+
+	sock := mkTempSocket(t)
+	b.sys.SocketPath = sock
+	other := mkTempSocket(t)
+	alias := sock + ".symlink"
+	if err := os.Symlink(sock, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	tcpTo := func(target string) *ipn.ServeConfig {
+		return &ipn.ServeConfig{TCP: map[uint16]*ipn.TCPPortHandler{443: {TCPForward: target}}}
+	}
+
+	tests := []struct {
+		name string
+		conf *ipn.ServeConfig
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no-unix-tcp", tcpTo("127.0.0.1:8080"), false},
+		{"other-socket", tcpTo("unix:" + other), false},
+		{"tcp-forward", tcpTo("unix:" + sock), true},
+		{"tcp-forward-via-symlink", tcpTo("unix:" + alias), true},
+		{
+			"web-proxy",
+			&ipn.ServeConfig{Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "unix:" + sock}}},
+			}},
+			true,
+		},
+		{
+			"foreground-tcp",
+			&ipn.ServeConfig{Foreground: map[string]*ipn.ServeConfig{
+				"sess": tcpTo("unix:" + sock),
+			}},
+			true,
+		},
+		{
+			"service-tcp",
+			&ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+				"svc:foo": {TCP: map[uint16]*ipn.TCPPortHandler{443: {TCPForward: "unix:" + sock}}},
+			}},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := b.serveTargetsTailscaledSocket(tt.conf.View()); got != tt.want {
+				t.Errorf("serveTargetsTailscaledSocket = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSetServeConfigRejectsTailscaledSocket confirms the guard is wired into
+// the config-set path, so "tailscale serve" is refused with a surfaced error
+// rather than silently accepted.
+func TestSetServeConfigRejectsTailscaledSocket(t *testing.T) {
+	b := newTestBackend(t)
+	sock := mkTempSocket(t)
+	b.sys.SocketPath = sock
+
+	err := b.setServeConfigLocked(&ipn.ServeConfig{
+		TCP: map[uint16]*ipn.TCPPortHandler{443: {TCPForward: "unix:" + sock}},
+	}, "")
+	if err == nil {
+		t.Fatal("setServeConfigLocked accepted a forward to the tailscaled socket; want it refused")
+	}
+}
+
+// TestReverseProxyRechecksTailscaledSocketPerDial verifies that a unix
+// backend that becomes a symlink to the tailscaled socket after the
+// handler was built is refused at dial time.
+func TestReverseProxyRechecksTailscaledSocketPerDial(t *testing.T) {
+	b := newTestBackend(t)
+	sock := mkTempSocket(t)
+	b.sys.SocketPath = sock
+	benign := mkTempSocket(t)
+
+	// Benign at config time, so the handler is built.
+	h, err := b.proxyHandlerForBackend("unix:" + benign)
+	if err != nil {
+		t.Fatalf("proxyHandlerForBackend(benign) = %v; want handler", err)
+	}
+	rp, ok := h.(*reverseProxy)
+	if !ok {
+		t.Fatalf("handler is %T; want *reverseProxy", h)
+	}
+	if _, err := rp.lb.dialServeUnixSocket(t.Context(), rp.socketPath); errors.Is(err, ErrProxyToTailscaledSocket) {
+		t.Fatalf("dial to the benign path was refused as the tailscaled socket")
+	}
+
+	// The path is swapped for a symlink to the tailscaled socket after the
+	// handler exists; the next dial must catch it.
+	if err := os.Remove(benign); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sock, benign); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rp.lb.dialServeUnixSocket(t.Context(), rp.socketPath); !errors.Is(err, ErrProxyToTailscaledSocket) {
+		t.Fatalf("dial after the symlink swap = %v; want ErrProxyToTailscaledSocket", err)
 	}
 }

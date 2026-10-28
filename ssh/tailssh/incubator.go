@@ -53,12 +53,15 @@ const (
 	windows = "windows"
 )
 
-// registerIncubator registers the incubator child process handlers.
+// registerIncubator registers the incubator child process handlers and
+// the per-connection ssh monitor.
 // It is called from [Register], which is called from the init of
 // tailscale.com/feature/ssh.
 func registerIncubator() {
 	childproc.Add("ssh", beIncubator)
 	childproc.Add("sftp", beSFTP)
+	childproc.Add("ssh-monitor", beMonitor)
+	childproc.Add("ssh-fwd", beFwdChild)
 }
 
 var ptyName = func(f *os.File) (string, error) {
@@ -108,6 +111,19 @@ func tryExecInDir(ctx context.Context, dir string) error {
 	return exec.ErrNotFound
 }
 
+// directExecAllowed reports whether the direct-exec fallback (used when
+// ss.conn.srv.tailscaledPath is empty) may run a session for lu as the given
+// effective uid. Unlike the incubator path there is no privilege drop, so a
+// root tailscaled must refuse to run a non-root user's session as root,
+// mirroring canSwitchToLocalUser's semantics (a non-root process can only
+// run a session as itself, which run() enforces).
+func directExecAllowed(euid int, lu *userMeta) bool {
+	if euid != 0 {
+		return true
+	}
+	return isRootUser(lu)
+}
+
 // newIncubatorCommand returns a new exec.Cmd configured with
 // `tailscaled be-child ssh` as the entrypoint.
 //
@@ -145,6 +161,14 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, forw
 			// SFTP relies on the embedded Go-based SFTP server in tailscaled,
 			// so without tailscaled, we can't serve SFTP.
 			return nil, nil, errors.New("no tailscaled found on path, can't serve SFTP")
+		}
+
+		// Without tailscaled there is no be-child incubator to drop
+		// privileges, so this fallback runs the session as the current
+		// user. A root tailscaled must refuse to run a non-root user's
+		// session as root, mirroring canSwitchToLocalUser's semantics.
+		if !directExecAllowed(os.Geteuid(), ss.conn.localUser) {
+			return nil, nil, fmt.Errorf("refusing to run session for local user %q as root without tailscaled", ss.conn.localUser.Username)
 		}
 
 		loginShell := ss.conn.localUser.LoginShell()
@@ -188,9 +212,12 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, forw
 		remoteUser = strings.Join(ci.node.Tags().AsSlice(), ",")
 	}
 
+	// incubatorArgs is the argv after the executable path and the
+	// incubatorSpawnPrefix. It holds the identity flags, the session
+	// flags, and the command. Tests that run a real session through the
+	// monitor override incubatorSpawnPrefix to route to beIncubator
+	// directly.
 	incubatorArgs := []string{
-		"be-child",
-		"ssh",
 		"--login-shell=" + lu.LoginShell(),
 		"--uid=" + lu.Uid,
 		"--gid=" + lu.Gid,
@@ -250,7 +277,8 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, forw
 		}
 	}
 
-	cmd = exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...)
+	argv := append(slices.Clone(incubatorSpawnPrefix), incubatorArgs...)
+	cmd = exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, argv...)
 	// The incubator will chdir into the home directory after it drops privileges.
 	cmd.Dir = "/"
 	return cmd, forwardedEnv, nil
@@ -260,6 +288,14 @@ var (
 	debugIncubator bool
 	debugTest      atomic.Bool
 )
+
+// incubatorSpawnPrefix is the argv prefix, after the executable path,
+// used to launch the incubator. In tailscaled it is "be-child ssh",
+// dispatched by cmd/tailscaled's beChild through childproc. Tests that
+// drive a real session through the monitor override this seam to
+// re-exec the test binary and dispatch to beIncubator via the helper
+// test.
+var incubatorSpawnPrefix = []string{"be-child", "ssh"}
 
 type incubatorArgs struct {
 	loginShell         string
@@ -353,32 +389,52 @@ func (ia *incubatorArgs) loadForwardedEnv() error {
 			return fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
 		}
 	}
-	// Enforce "su -w" integrity child-side: old parents may not have filtered these
+	// Enforce "su -w" integrity and the dangerous-env-var denylist
+	// child-side: old parents may not have filtered these.
 	pairs = slices.DeleteFunc(pairs, func(kv string) bool {
 		k, _, ok := strings.Cut(kv, "=")
-		return !ok || forbiddenEnvKey(k) || strings.Contains(kv, "\x00")
+		return !ok || isDangerousEnvVar(k) || forbiddenEnvKey(k) || strings.Contains(kv, "\x00")
 	})
 	ia.forwardedEnv = pairs
 	return nil
 }
 
-// forwardedEnviron returns the environment to hand to the user's process. This includes the
-// current environment plus the client-forwarded pairs. It also returns allowedExtraKeys for
-// the "su -w" allowlist, the forwarded key names, plus SSH_AUTH_SOCK.
-func (ia *incubatorArgs) forwardedEnviron() (env, allowedExtraKeys []string) {
-	// SSH_AUTH_SOCK is allowlisted here rather than forwarded because old
-	// parents set it without forwarding any keys. It can only be present if
-	// the parent enabled agent forwarding: the child's environment is built
-	// by incubatorEnv, never from the parent's os.Environ.
-	allowedExtraKeys = []string{"SSH_AUTH_SOCK"}
+// forwardedEnviron appends accepted client values to the filtered base environment.
+func (ia *incubatorArgs) forwardedEnviron() []string {
+	return append(ia.rootExecEnviron(), ia.forwardedEnv...)
+}
 
-	env = append(os.Environ(), ia.forwardedEnv...)
+// rootExecEnviron copies the incubator environment without TERM or locale
+// variables. login and su receive forwardedEnv in addition to this base;
+// the capability probe receives only the base.
+func (ia *incubatorArgs) rootExecEnviron() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if k, _, ok := strings.Cut(kv, "="); ok && clientDerivedEnvKey(k) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+// clientDerivedEnvKey identifies the default client environment variables
+// accepted by incubatorEnv, including TERM from a PTY request.
+func clientDerivedEnvKey(k string) bool {
+	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
+}
+
+// suAllowEnvKeys returns the "su -w" allowlist for the given args:
+// SSH_AUTH_SOCK plus the names of the policy-forwarded pairs.
+func (ia *incubatorArgs) suAllowEnvKeys() []string {
+	keys := make([]string, 0, 1+len(ia.forwardedEnv))
+	keys = append(keys, "SSH_AUTH_SOCK")
 	for _, kv := range ia.forwardedEnv {
 		if k, _, ok := strings.Cut(kv, "="); ok {
-			allowedExtraKeys = append(allowedExtraKeys, k)
+			keys = append(keys, k)
 		}
 	}
-	return env, allowedExtraKeys
+	return keys
 }
 
 // beIncubator is the entrypoint to the `tailscaled be-child ssh` subcommand.
@@ -547,7 +603,7 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
 	loginArgs := ia.loginArgs(loginCmdPath)
 	dlogf("logging in with %+v", loginArgs)
 
-	environ, _ := ia.forwardedEnviron()
+	environ := append(ia.rootExecEnviron(), ia.forwardedEnv...)
 
 	// If Exec works, the Go code will not proceed past this:
 	err = unix.Exec(loginCmdPath, loginArgs, environ)
@@ -583,7 +639,10 @@ func trySU(dlogf logger.Logf, ia incubatorArgs) (handled bool, err error) {
 		defer sessionCloser()
 	}
 
-	environ, allowListEnvKeys := ia.forwardedEnviron()
+	// Pass forwarded pairs in su's environment and allow -w to copy
+	// them into the login shell's environment.
+	environ := append(ia.rootExecEnviron(), ia.forwardedEnv...)
+	allowListEnvKeys := ia.suAllowEnvKeys()
 
 	loginArgs := []string{
 		su,
@@ -628,23 +687,28 @@ func findSU(dlogf logger.Logf, ia incubatorArgs) string {
 		return ""
 	}
 
-	_, allowListEnvKeys := ia.forwardedEnviron()
-
 	// First try to execute su -w <allow listed env> -l <user> -c true
 	// to make sure su supports the necessary arguments.
-	err = exec.Command(
-		su,
-		"-w", strings.Join(allowListEnvKeys, ","),
-		"-l",
-		ia.localUser,
-		"-c", "true",
-	).Run()
-	if err != nil {
+	if err := suProbeCmd(ia, su).Run(); err != nil {
 		dlogf("su check failed: %s", err)
 		return ""
 	}
 
 	return su
+}
+
+// suProbeCmd builds findSU's capability probe command. The probe runs
+// su with rootExecEnviron.
+func suProbeCmd(ia incubatorArgs, su string) *exec.Cmd {
+	cmd := exec.Command(
+		su,
+		"-w", strings.Join(ia.suAllowEnvKeys(), ","),
+		"-l",
+		ia.localUser,
+		"-c", "true",
+	)
+	cmd.Env = ia.rootExecEnviron()
+	return cmd
 }
 
 // handleSSHInProcess is a last resort if we couldn't use login or su. It
@@ -661,7 +725,8 @@ func handleSSHInProcess(dlogf logger.Logf, ia incubatorArgs) error {
 		return err
 	}
 
-	environ, _ := ia.forwardedEnviron()
+	// Build the shell environment after dropping privileges.
+	environ := ia.forwardedEnviron()
 
 	args := shellArgs(ia.isShell, ia.cmd)
 	dlogf("running %s %q", ia.loginShell, args)
@@ -840,6 +905,13 @@ func (ss *sshSession) incubatorEnv() []string {
 			env = append(env, kv)
 		}
 	}
+	// The pty request's TERM passes the same acceptEnvPair value rule as
+	// the environ-sourced TERM. It is assembled here, with the rest of
+	// the client-derived environment, so the client-derived pairs can be
+	// forwarded to the incubator through one channel; see launchProcess.
+	if ptyReq, _, isPty := ss.Pty(); isPty && ptyReq.Term != "" && acceptEnvPair("TERM="+ptyReq.Term) {
+		env = append(env, "TERM="+ptyReq.Term)
+	}
 
 	ci := ss.conn.info
 	env = append(env,
@@ -854,9 +926,32 @@ func (ss *sshSession) incubatorEnv() []string {
 	return env
 }
 
+// mergeForwardedEnv adds default TERM and locale values not already present
+// in forwarded. Defaults use last-value-wins, as exec.Cmd.Env does.
+func mergeForwardedEnv(env, forwarded []string) []string {
+	seen := make(map[string]bool)
+	for _, kv := range forwarded {
+		k, _, _ := strings.Cut(kv, "=")
+		seen[k] = true
+	}
+	for _, kv := range slices.Backward(env) {
+		if k, _, ok := strings.Cut(kv, "="); ok && clientDerivedEnvKey(k) && !seen[k] {
+			forwarded = append(forwarded, kv)
+			seen[k] = true
+		}
+	}
+	return forwarded
+}
+
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
-// The caller can wait for the process to exit by calling cmd.Wait().
+// The caller can wait for the process to exit by calling cmd.Wait() or,
+// on the monitor path, by waiting on waitProcess's exit-notification
+// wait.
+//
+// On unix with a tailscaled binary the child is exec'd by the conn's
+// ssh-monitor via launchViaMonitor; the direct-exec fallback, with no
+// tailscaled binary, and plan9 keep the direct start.
 //
 // It sets ss.cmd, stdin, stdout, and stderr.
 func (ss *sshSession) launchProcess() error {
@@ -870,11 +965,21 @@ func (ss *sshSession) launchProcess() error {
 	cmd := ss.cmd
 	cmd.Env = ss.incubatorEnv()
 
-	if len(forwardedEnv) > 0 {
-		// The accepted environment may contain secrets, so it is passed to the child via an
-		// inherited file, never the argv or the environment. Closing after Start is safe: the
-		// child has its own copy by then.
-		envFile, err := forwardedEnvFile(forwardedEnv)
+	// Pass default TERM and locale variables through the environment pipe.
+	// Policy-forwarded values take precedence over these defaults.
+	if ss.conn.srv.tailscaledPath != "" {
+		forwardedEnv = mergeForwardedEnv(cmd.Env, forwardedEnv)
+	}
+	// Add --env-fd if the merged environment is non-empty.
+	if len(forwardedEnv) > 0 && !slices.Contains(cmd.Args, fmt.Sprintf("--env-fd=%d", forwardedEnvChildFD)) {
+		cmd.Args = append(cmd.Args, fmt.Sprintf("--env-fd=%d", forwardedEnvChildFD))
+	}
+
+	// Create the environment pipe for incubator sessions. Close the
+	// parent copy after launch; the child then owns its copy.
+	var envFile *os.File
+	if len(forwardedEnv) > 0 && ss.conn.srv.tailscaledPath != "" {
+		envFile, err = forwardedEnvFile(forwardedEnv)
 		if err != nil {
 			return err
 		}
@@ -885,7 +990,7 @@ func (ss *sshSession) launchProcess() error {
 	ptyReq, winCh, isPty := ss.Pty()
 	if !isPty {
 		ss.logf("starting non-pty command: %+v", cmd.Args)
-		return ss.startWithStdPipes()
+		return ss.startWithStdPipes(envFile)
 	}
 
 	if sshDisablePTY() {
@@ -894,37 +999,67 @@ func (ss *sshSession) launchProcess() error {
 	}
 
 	ss.ptyReq = &ptyReq
-	pty, tty, err := ss.startWithPTY()
+	pty, tty, err := ss.startWithPTY(envFile)
 	if err != nil {
 		return err
 	}
 
-	// We need to be able to close stdin and stdout separately later so make a
-	// dup.
-	ptyDup, err := syscall.Dup(int(pty.Fd()))
+	// We need to be able to close stdin and stdout separately later so make
+	// dups. Use F_DUPFD_CLOEXEC rather than dup(2): a plain dup does not set
+	// FD_CLOEXEC, so the pty master would be inherited by every other SSH
+	// session's child process started while this session is alive. A leaked
+	// master keeps the pty open after this session ends, so its slave never
+	// hangs up and processes writing to it (e.g. a tmux server) block forever.
+	//
+	// The resize goroutine owns the second dup, so a window-change
+	// request acts on a descriptor held open for its goroutine's
+	// lifetime.
+	outDup, err := unix.FcntlInt(pty.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		pty.Close()
 		tty.Close()
 		return err
 	}
-	go resizeWindow(ptyDup /* arbitrary fd */, winCh)
+	resizeDup, err := unix.FcntlInt(pty.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		unix.Close(outDup)
+		pty.Close()
+		tty.Close()
+		return err
+	}
+	go resizeWindow(os.NewFile(uintptr(resizeDup), pty.Name()), winCh)
 
 	ss.wrStdin = pty
-	ss.rdStdout = os.NewFile(uintptr(ptyDup), pty.Name())
+	ss.rdStdout = os.NewFile(uintptr(outDup), pty.Name())
 	ss.rdStderr = nil // not available for pty
 	ss.childPipes = []io.Closer{tty}
 
 	return nil
 }
 
-func resizeWindow(fd int, winCh <-chan gliderssh.Window) {
+// sessionViaMonitor reports whether this session's child is exec'd by
+// the conn's ssh-monitor instead of being started directly by
+// tailscaled. The monitor route requires a tailscaled binary; plan9
+// has no monitor.
+func (ss *sshSession) sessionViaMonitor() bool {
+	return ss.conn.srv.tailscaledPath != ""
+}
+
+// resizeWindow applies window-change requests to the session's pty
+// master. It stops when the SSH channel closes its window channel or
+// when the ioctl on the master fails. f is this goroutine's own
+// descriptor of the master, held open for the goroutine's lifetime.
+func resizeWindow(f *os.File, winCh <-chan gliderssh.Window) {
+	defer f.Close()
 	for win := range winCh {
-		unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
+		if err := unix.IoctlSetWinsize(int(f.Fd()), syscall.TIOCSWINSZ, &unix.Winsize{
 			Row:    uint16(win.Height),
 			Col:    uint16(win.Width),
 			Xpixel: uint16(win.WidthPixels),
 			Ypixel: uint16(win.HeightPixels),
-		})
+		}); err != nil {
+			return
+		}
 	}
 }
 
@@ -990,8 +1125,9 @@ var opcodeShortName = map[uint8]string{
 	ssh.TTY_OP_OSPEED: "tty_op_ospeed",
 }
 
-// startWithPTY starts cmd with a pseudo-terminal attached to Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
+// startWithPTY starts the session with a pseudo-terminal as its stdio.
+// On the monitor path, the slave descriptors are passed via SCM_RIGHTS.
+func (ss *sshSession) startWithPTY(envFile *os.File) (ptyFile, tty *os.File, err error) {
 	ptyReq := ss.ptyReq
 	cmd := ss.cmd
 	if cmd == nil {
@@ -1066,10 +1202,6 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 	if ctlErr != nil {
 		return nil, nil, fmt.Errorf("ptyRawConn.Control func: %w", ctlErr)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setctty: true,
-		Setsid:  true,
-	}
 	updateStringInSlice(cmd.Args, "--has-tty=false", "--has-tty=true")
 	if ptyName, err := ptyName(ptyFile); err == nil {
 		updateStringInSlice(cmd.Args, "--tty-name=", "--tty-name="+ptyName)
@@ -1077,8 +1209,21 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_TTY=%s", fullPath))
 	}
 
-	if ptyReq.Term != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+	// The pty request's TERM is assembled in incubatorEnv with the rest
+	// of the client-derived pairs, so it reaches the incubator through
+	// the accepted-pairs channel; see launchProcess.
+
+	if ss.sessionViaMonitor() {
+		ss.logf("starting pty command via session monitor: %+v", cmd.Args)
+		if err := ss.launchViaMonitor(cmd, envFile, []*os.File{tty, tty, tty}, true); err != nil {
+			return nil, nil, err
+		}
+		return ptyFile, tty, nil
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setctty: true,
+		Setsid:  true,
 	}
 	cmd.Stdin = tty
 	cmd.Stdout = tty
@@ -1092,8 +1237,11 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 }
 
 // startWithStdPipes starts cmd with os.Pipe for Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithStdPipes() (err error) {
-	var rdStdin, wrStdout, wrStderr io.ReadWriteCloser
+// On the monitor path the child is exec'd by the conn's ssh-monitor via
+// launchViaMonitor, which also carries the env-fd pipe; tailscaled
+// keeps its own pipe ends in childPipes.
+func (ss *sshSession) startWithStdPipes(envFile *os.File) (err error) {
+	var rdStdin, wrStdout, wrStderr *os.File
 	defer func() {
 		if err != nil {
 			closeAll(rdStdin, ss.wrStdin, ss.rdStdout, wrStdout, ss.rdStderr, wrStderr)
@@ -1111,10 +1259,13 @@ func (ss *sshSession) startWithStdPipes() (err error) {
 	if ss.rdStderr, wrStderr, err = os.Pipe(); err != nil {
 		return err
 	}
+	ss.childPipes = []io.Closer{rdStdin, wrStdout, wrStderr}
+	if ss.sessionViaMonitor() {
+		return ss.launchViaMonitor(ss.cmd, envFile, []*os.File{rdStdin, wrStdout, wrStderr}, false)
+	}
 	ss.cmd.Stdin = rdStdin
 	ss.cmd.Stdout = wrStdout
 	ss.cmd.Stderr = wrStderr
-	ss.childPipes = []io.Closer{rdStdin, wrStdout, wrStderr}
 	return ss.cmd.Start()
 }
 
@@ -1122,8 +1273,11 @@ func envForUser(u *userMeta) []string {
 	return []string{
 		fmt.Sprintf("SHELL=%s", u.LoginShell()),
 		fmt.Sprintf("USER=%s", u.Username),
+		// Some systems require $LOGNAME. Just like OpenSSH sshd, set it to the
+		// same value as $USER.
+		fmt.Sprintf("LOGNAME=%s", u.Username),
 		fmt.Sprintf("HOME=%s", u.HomeDir),
-		fmt.Sprintf("PATH=%s", defaultPathForUser(&u.User)),
+		fmt.Sprintf("PATH=%s", defaultPathForUser(u)),
 	}
 }
 
@@ -1141,12 +1295,27 @@ func updateStringInSlice(ss []string, a, b string) {
 // acceptEnvPair reports whether the environment variable key=value pair
 // should be accepted from the client. It uses the same default as OpenSSH
 // AcceptEnv.
+//
+// The value reaches root-exec'd login/su environments, where glibc treats
+// a LANG/LC_* value containing "/" as a path to locale data and a leading
+// "-" as its own options; TERM is a terminal capability name, not a path.
+// Reject path- and option-like values (and NUL, which would truncate on
+// exec) rather than trying to sanitize them.
 func acceptEnvPair(kv string) bool {
-	k, _, ok := strings.Cut(kv, "=")
+	k, v, ok := strings.Cut(kv, "=")
 	if !ok || isDangerousEnvVar(k) || forbiddenEnvKey(k) {
 		return false
 	}
-	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
+	if strings.Contains(v, "\x00") {
+		return false
+	}
+	if k == "TERM" {
+		return !strings.Contains(v, "/")
+	}
+	if k == "LANG" || strings.HasPrefix(k, "LC_") {
+		return !strings.Contains(v, "/") && !strings.HasPrefix(v, "-")
+	}
+	return false
 }
 
 func fileExists(path string) bool {

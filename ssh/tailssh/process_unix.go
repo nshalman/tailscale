@@ -13,16 +13,41 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"syscall"
 
 	gliderssh "github.com/tailscale/gliderssh"
 )
 
+// monitorProcess identifies one exec child. ID is the exec request ID, which
+// distinguishes successive children even when the operating system reuses a PID.
+type monitorProcess struct {
+	PID int
+	ID  int64
+}
+
+// monExitStatus publishes an exit code to any number of waiters. The registry
+// completes it once; code may be read only after done is closed.
+type monExitStatus struct {
+	done chan struct{}
+	code int
+}
+
 // osSessionState holds the platform-specific state of an [sshSession]'s
 // process. It is embedded in [sshSession] and initialized by launchProcess.
+//
+// cmd describes the invocation on both paths. monChild identifies a monitor
+// child; cmd.Process identifies a directly launched child.
 type osSessionState struct {
-	cmd *exec.Cmd // the session's incubator or shell process
+	// cmd is the session's incubator or shell process on the direct path.
+	// It is set but never started on the monitor path.
+	cmd *exec.Cmd
+
+	monChild monitorProcess // zero on the direct path
+	// monExit publishes the exit status, or 128+signal for a signaled death.
+	monExit *monExitStatus
+	// monDead is closed when the monitor's RPC channel is gone, so
+	// waiting sessions fail instead of blocking.
+	monDead <-chan struct{}
 }
 
 // forwardedEnvChildFD is the fd the incubator child reads the forwarded environment from, sent via
@@ -68,6 +93,11 @@ func canSwitchToLocalUser(lu *userMeta) error {
 // waitProcess waits for the session's process to exit and returns its exit
 // code. A non-nil error means the exit code could not be determined.
 func (ss *sshSession) waitProcess() (exitCode int, err error) {
+	// Monitor path: the child's exit arrives as the monitor's async
+	// exit notification, with the code documented on monExit.
+	if code, ok, merr := ss.waitMonitorProcess(); ok {
+		return code, merr
+	}
 	err = ss.cmd.Wait()
 	if err == nil {
 		return 0, nil
@@ -78,9 +108,13 @@ func (ss *sshSession) waitProcess() (exitCode int, err error) {
 	return 1, err
 }
 
-// hangupProcess asks the session's process to terminate because the session
-// is over.
+// hangupProcess asks the session's process to terminate because the
+// session is over. On the monitor path this is hangupMonitorProcess.
+// On the direct path it is a single SIGHUP to the child pid.
 func (ss *sshSession) hangupProcess() {
+	if ss.hangupMonitorProcess() {
+		return
+	}
 	// SIGHUP = POSIX terminal-disconnect semantics; OpenSSH gets it
 	// implicitly via PTY-master close (session.c:2246), we send it
 	// explicitly because non-PTY sessions use pipes.
@@ -100,8 +134,15 @@ func systemHostKeyFile(typ string) string {
 // handleSSHAgentForwarding starts a Unix socket listener and in the background
 // forwards agent connections between the listener and the gliderssh.Session.
 // On success, it assigns ss.agentListener.
+//
+// The listener and its containing directory are created by a user-cred
+// child through conn.fwdListenAgent. See the docs there for the modes.
 func (ss *sshSession) handleSSHAgentForwarding(s gliderssh.Session, lu *userMeta) error {
 	if !gliderssh.AgentRequested(ss) || !ss.conn.finalAction.AllowAgentForwarding {
+		return nil
+	}
+	// The latched AllowAgentForwarding bit may be stale. See recheckPolicy.
+	if !ss.conn.recheckPolicy() {
 		return nil
 	}
 	if sshDisableForwarding() {
@@ -111,40 +152,36 @@ func (ss *sshSession) handleSSHAgentForwarding(s gliderssh.Session, lu *userMeta
 		return nil
 	}
 	ss.logf("ssh: agent forwarding requested")
-	ln, err := gliderssh.NewAgentListener()
+	ln, socket, err := ss.conn.fwdListenAgent(s.Context(), lu)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil && ln != nil {
-			ln.Close()
-		}
-	}()
-
-	// 31 bits so that the values fit an int on every platform.
-	uid, err := strconv.ParseUint(lu.Uid, 10, 31)
-	if err != nil {
-		return err
+	// The listener's own address is the kernel's bound path; socket is
+	// the path the child reported and the monitor validated. They must
+	// agree: the cleanup removes the directory of the validated path, so
+	// a child whose report and actual bind disagree is refused.
+	if got := ln.Addr().String(); got != socket {
+		ln.Close()
+		return fmt.Errorf("agent forwarding socket path %q does not match the listener's bound path %q", socket, got)
 	}
-	gid, err := strconv.ParseUint(lu.Gid, 10, 31)
-	if err != nil {
-		return err
-	}
-	socket := ln.Addr().String()
-	dir := filepath.Dir(socket)
-	// Make sure the socket is accessible only by the user.
-	if err := os.Chmod(socket, 0600); err != nil {
-		return err
-	}
-	if err := os.Chown(socket, int(uid), int(gid)); err != nil {
-		return err
-	}
-	// Make sure the dir is also accessible.
-	if err := os.Chmod(dir, 0755); err != nil {
-		return err
-	}
-
-	go gliderssh.ForwardAgentConnections(ln, s)
 	ss.agentListener = ln
+	go gliderssh.ForwardAgentConnections(ln, s)
 	return nil
+}
+
+// closeAgentForwarding closes the agent forwarding listener and removes the
+// temporary directory that holds its socket, so neither outlives the
+// session. The removal rules are platform-specific: on the monitor
+// platforms the directory was created by a user-cred child while the
+// removal runs with the daemon's credentials; see
+// removeAgentForwardingDir in fwdmonitor.go and fwdplan9.go.
+func (ss *sshSession) closeAgentForwarding() {
+	ln := ss.agentListener
+	if ln == nil {
+		return
+	}
+	ss.agentListener = nil
+	dir := filepath.Dir(ln.Addr().String())
+	ln.Close()
+	removeAgentForwardingDir(dir, ss.conn.localUser, ss.logf)
 }

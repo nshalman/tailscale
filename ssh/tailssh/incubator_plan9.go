@@ -218,10 +218,11 @@ func (ia *incubatorArgs) loadForwardedEnv() error {
 			return fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
 		}
 	}
-	// Enforce "su -w" integrity child-side: old parents may not have filtered these
+	// Enforce "su -w" integrity and the dangerous-env-var denylist
+	// child-side: old parents may not have filtered these
 	pairs = slices.DeleteFunc(pairs, func(kv string) bool {
 		k, _, ok := strings.Cut(kv, "=")
-		return !ok || forbiddenEnvKey(k) || strings.Contains(kv, "\x00")
+		return !ok || isDangerousEnvVar(k) || forbiddenEnvKey(k) || strings.Contains(kv, "\x00")
 	})
 	ia.forwardedEnv = pairs
 	return nil
@@ -423,11 +424,24 @@ func (ss *sshSession) startWithStdPipes() (err error) {
 	return ss.cmd.Start()
 }
 
+// waitMonitorProcess is the plan9 seam of the monitor session path.
+// plan9 has no monitor, so it always reports the direct path.
+func (ss *sshSession) waitMonitorProcess() (code int, ok bool, err error) {
+	return 0, false, nil
+}
+
+// hangupMonitorProcess is the plan9 seam of the monitor session path.
+// It always reports false, so sessions hang up their directly-started
+// child.
+func (ss *sshSession) hangupMonitorProcess() bool {
+	return false
+}
+
 func envForUser(u *userMeta) []string {
 	return []string{
 		fmt.Sprintf("user=%s", u.Username),
 		fmt.Sprintf("home=%s", u.HomeDir),
-		fmt.Sprintf("path=%s", defaultPathForUser(&u.User)),
+		fmt.Sprintf("path=%s", defaultPathForUser(u)),
 	}
 }
 
