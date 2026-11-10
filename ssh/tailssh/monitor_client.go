@@ -25,6 +25,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"tailscale.com/hostinfo"
 )
 
 // monitorSpawnPrefix is the argv prefix following the executable path,
@@ -48,8 +50,13 @@ func spawnMonitor(exe string, uid, gid uint32, groups []uint32, localUser string
 		"--local-user="+localUser,
 		"--rpc-fd=3",
 	)
-	// The monitor is its own session leader.
-	cmd, parentConn, err := spawnRPCChild("ssh-monitor", exe, argv, os.Environ(), &syscall.SysProcAttr{Setsid: true})
+	// The monitor is its own session leader. It is a tailscaled
+	// re-exec, not a service instance. Give it the daemon's environment
+	// without the systemd service variables, so neither the monitor
+	// nor any helper it execs can notify the tailscaled unit. See
+	// [hostinfo.EnvironWithoutSystemdServiceVars].
+	cmd, parentConn, err := spawnRPCChild("ssh-monitor", exe, argv,
+		hostinfo.EnvironWithoutSystemdServiceVars(nil), &syscall.SysProcAttr{Setsid: true})
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +90,7 @@ type monitorClient struct {
 	// writeMu serializes writeFrame, so the client has one logical
 	// writer.
 	writeMu sync.Mutex
+	closeMu sync.Mutex // serializes Close
 
 	mu      sync.Mutex // guards the fields below
 	nextID  int64
@@ -311,6 +319,28 @@ func (mc *monitorClient) Signal(ctx context.Context, child monitorProcess, sig s
 	return err
 }
 
+// Terminate sends SIGHUP to child's group and schedules SIGKILL after grace.
+// Escalation continues after leader exit or graceful close.
+func (mc *monitorClient) Terminate(ctx context.Context, child monitorProcess, grace time.Duration) error {
+	r, _, err := mc.call(ctx, rpcTerminateReq(child, grace))
+	if err != nil && r.Op == "" {
+		// Require connection-wide termination if the request was not acknowledged.
+		mc.c.Close()
+	}
+	return err
+}
+
+// KillAll requires teardown to terminate all session children.
+// Call it before [monitorClient.Close] when access is revoked.
+func (mc *monitorClient) KillAll(ctx context.Context) error {
+	_, _, err := mc.call(ctx, rpcKillAllReq(0))
+	if err != nil {
+		// Require connection-wide termination if revocation was not acknowledged.
+		mc.c.Close()
+	}
+	return err
+}
+
 // Dial dials a unix socket through a relay child running with the
 // connection's bound identity. The returned data socket and lifetime pipe
 // are acknowledged to the monitor on receipt, releasing its held copies.
@@ -428,19 +458,26 @@ func wrapListenerFD(fd int, name string) (net.Listener, error) {
 	return ln, nil
 }
 
-// Close tears the connection down by closing the RPC channel, which
-// triggers the monitor's teardown. Close waits for the monitor to
-// exit. A wedged monitor is killed after the forwarding-op deadline,
-// both teardown reap sweeps, and a margin for scheduling and child reap.
+// Close requests graceful teardown and waits for the monitor to exit.
+// RPC loss without a graceful close request terminates all children.
+// A monitor that exceeds the shutdown timeout is killed.
 func (mc *monitorClient) Close() error {
+	mc.closeMu.Lock()
+	defer mc.closeMu.Unlock()
 	mc.mu.Lock()
 	if mc.closed {
 		mc.mu.Unlock()
 		return nil
 	}
-	mc.closed = true
 	mc.mu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), monFwdOpDeadline)
+	// RPC loss without this request requires connection-wide termination.
+	_, _, _ = mc.call(ctx, rpcFrame{Op: opClose})
+	cancel()
+	mc.mu.Lock()
+	mc.closed = true
+	mc.mu.Unlock()
 	mc.c.Close()
 	<-mc.done
 	waitErr := make(chan error, 1)

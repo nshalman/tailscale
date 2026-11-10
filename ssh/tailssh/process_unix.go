@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	gliderssh "github.com/tailscale/gliderssh"
 )
@@ -108,17 +109,35 @@ func (ss *sshSession) waitProcess() (exitCode int, err error) {
 	return 1, err
 }
 
-// hangupProcess asks the session's process to terminate because the
-// session is over. On the monitor path this is hangupMonitorProcess.
-// On the direct path it is a single SIGHUP to the child pid.
-func (ss *sshSession) hangupProcess() {
-	if ss.hangupMonitorProcess() {
+// hangupProcess closes the PTY. If mandated is true, it also sends SIGHUP
+// and schedules SIGKILL. Otherwise it sends no explicit signals.
+func (ss *sshSession) hangupProcess(mandated bool) {
+	// Register termination before PTY closure can send SIGHUP.
+	monitored := ss.hangupMonitorProcess(mandated)
+	if ss.ptyReq != nil {
+		// Close every PTY master descriptor so the terminal driver sends SIGHUP.
+		closeAll(ss.wrStdin, ss.rdStdout, ss.ptyResize)
+		if !mandated {
+			return
+		}
+	}
+	if monitored {
 		return
 	}
-	// SIGHUP = POSIX terminal-disconnect semantics; OpenSSH gets it
-	// implicitly via PTY-master close (session.c:2246), we send it
-	// explicitly because non-PTY sessions use pipes.
-	ss.cmd.Process.Signal(syscall.SIGHUP)
+	if ss.cmd == nil || ss.cmd.Process == nil {
+		return
+	}
+	p := ss.cmd.Process
+	// The process handle synchronizes signaling with exit and reaping.
+	if !mandated {
+		return
+	}
+	if ss.ptyReq == nil {
+		p.Signal(syscall.SIGHUP)
+	}
+	time.AfterFunc(knobDuration(sshHupEscalation(), defaultHupEscalation), func() {
+		p.Signal(syscall.SIGKILL)
+	})
 }
 
 // systemHostKeyFile returns the path of the system's OpenSSH host key of the
